@@ -10,8 +10,8 @@ const MIRRORS: &[&str] = &[
 ];
 
 // Dedicated folders
-const RAW_DATA_DIR: &str = "data/raw";
-const PROCESSED_DATA_DIR: &str = "data/processed";
+const RAW_DATA_DIR: &str = "assets/data/raw";
+const PROCESSED_DATA_DIR: &str = "assets/data/processed";
 const OSM_FILE: &str = "bangladesh-latest.osm.pbf";
 
 fn download_map() -> Result<()> {
