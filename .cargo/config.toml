@@ -2,4 +2,4 @@
 [alias]
 dev = "run --bin bangladesh --features bevy/dynamic_linking"
 release = "run --release"
-build-data = "run --bin data_builder"
+map-gen = "run --bin map_gen"
