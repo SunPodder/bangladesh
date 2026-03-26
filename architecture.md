@@ -17,6 +17,7 @@
 - `playable_zoom_level` is the highest-detail terrain level (normal gameplay).
 - Lower zooms are unplayable overview layers that progressively drop detail but keep continuity.
 - Runtime converts camera scale -> zoom level and only keeps visible tiles (plus margin) resident.
+- Pyramid downsampling now uses dominant-terrain voting per $2 \times 2$ sample window (with water-safe tie breaks) to prevent river/ocean classes from flooding land at overview zooms.
 
 ## Networking (Server-Authoritative)
 - **Library**: `lightyear`.
@@ -37,3 +38,6 @@
 - **GIS**: `osmpbf`, `geo-types`.
 - **Net**: `lightyear` (Server-authoritative).
 - **CLI**: `clap` (derive), `indicatif` (progress).
+
+## Runtime Debugging
+- Press `F3` in runtime to toggle an on-screen debug HUD with player coordinates, cursor world coordinates, and current loaded zoom level.

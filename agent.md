@@ -20,3 +20,4 @@
 - 2026-03-26: Upgrade terrain world format to a multi-zoom tile pyramid `(zoom, x, y)` with playable zoom offsets, bake overview layers during `map_gen`, and stream tiles by camera zoom + viewport for smooth zoom-out to full-map view.
 - 2026-03-26: Refactor `map_gen` into modular submodules under `src/bin/map_gen/` to keep GIS processing maintainable while preserving ECS-friendly data boundaries.
 - 2026-03-26: Standardize map asset storage to `assets/map/` with `.pbf` and `.world` separated by extension, and default unresolved terrain areas to grass during bake/downsampling.
+- 2026-03-26: Fix LOD flood bug by replacing pyramid downsample priority-max merge with dominant-terrain voting and a water-safe tie break, and add `F3` runtime debug HUD for coords + zoom visibility.

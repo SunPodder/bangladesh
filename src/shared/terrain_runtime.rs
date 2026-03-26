@@ -41,6 +41,11 @@ struct ZoomController {
     target_scale: f32,
 }
 
+#[derive(Resource, Default)]
+struct DebugOverlayState {
+    visible: bool,
+}
+
 struct LoadedTile {
     _bytes: Vec<u8>,
     entities: Vec<Entity>,
@@ -48,6 +53,12 @@ struct LoadedTile {
 
 #[derive(Component)]
 struct StreamPlayer;
+
+#[derive(Component)]
+struct DebugOverlayRoot;
+
+#[derive(Component)]
+struct DebugOverlayText;
 
 impl Plugin for TerrainStreamingPlugin {
     fn build(&self, app: &mut App) {
@@ -57,8 +68,9 @@ impl Plugin for TerrainStreamingPlugin {
             zoom_lerp_speed: 8.0,
             preload_margin_tiles: 1,
         });
+        app.insert_resource(DebugOverlayState::default());
 
-        app.add_systems(Startup, (setup_terrain_view, open_world).chain());
+        app.add_systems(Startup, (setup_terrain_view, setup_debug_overlay, open_world).chain());
         app.add_systems(
             Update,
             (
@@ -67,6 +79,8 @@ impl Plugin for TerrainStreamingPlugin {
                 smooth_zoom_camera,
                 follow_player_camera,
                 update_map_lod,
+                toggle_debug_overlay,
+                update_debug_overlay_text,
             )
                 .chain(),
         );
@@ -81,6 +95,33 @@ fn setup_terrain_view(mut commands: Commands) {
         Sprite::from_color(Color::srgb(1.0, 0.2, 0.2), Vec2::splat(10.0)),
         Transform::from_xyz(0.0, 0.0, 10.0),
     ));
+}
+
+fn setup_debug_overlay(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                left: Val::Px(12.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.05, 0.07, 0.11, 0.80)),
+            Visibility::Hidden,
+            DebugOverlayRoot,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("F3 Debug"),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.95, 0.97, 1.0)),
+                DebugOverlayText,
+            ));
+        });
 }
 
 fn open_world(
@@ -257,6 +298,79 @@ fn follow_player_camera(
 
     camera_transform.translation.x = player_transform.translation.x;
     camera_transform.translation.y = player_transform.translation.y;
+}
+
+fn toggle_debug_overlay(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut overlay_state: ResMut<DebugOverlayState>,
+    mut root_query: Query<&mut Visibility, With<DebugOverlayRoot>>,
+) {
+    if !keyboard.just_pressed(KeyCode::F3) {
+        return;
+    }
+
+    overlay_state.visible = !overlay_state.visible;
+    let next_visibility = if overlay_state.visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+
+    for mut visibility in &mut root_query {
+        *visibility = next_visibility;
+    }
+}
+
+fn update_debug_overlay_text(
+    overlay_state: Res<DebugOverlayState>,
+    state: Option<Res<TerrainWorldState>>,
+    player_query: Query<&Transform, With<StreamPlayer>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
+    mut text_query: Query<&mut Text, With<DebugOverlayText>>,
+) {
+    if !overlay_state.visible {
+        return;
+    }
+
+    let Ok(mut text) = text_query.single_mut() else {
+        return;
+    };
+
+    let player_coords = player_query
+        .single()
+        .ok()
+        .map(|transform| {
+            (
+                transform.translation.x,
+                transform.translation.y,
+                transform.translation.z,
+            )
+        })
+        .unwrap_or((0.0, 0.0, 0.0));
+
+    let cursor_coords = (|| {
+        let (camera, camera_transform) = camera_query.single().ok()?;
+        let window = window_query.single().ok()?;
+        let cursor_screen = window.cursor_position()?;
+        camera
+            .viewport_to_world_2d(camera_transform, cursor_screen)
+            .ok()
+    })();
+
+    let zoom_level_text = state
+        .as_ref()
+        .map(|world_state| world_state.current_zoom_level.to_string())
+        .unwrap_or_else(|| "N/A".to_string());
+
+    let cursor_text = cursor_coords
+        .map(|coords| format!("{:.1}, {:.1}", coords.x, coords.y))
+        .unwrap_or_else(|| "N/A".to_string());
+
+    text.0 = format!(
+        "F3 Debug\nPlayer: ({:.1}, {:.1}, {:.1})\nCursor: ({})\nZoom: {}",
+        player_coords.0, player_coords.1, player_coords.2, cursor_text, zoom_level_text
+    );
 }
 
 fn update_map_lod(

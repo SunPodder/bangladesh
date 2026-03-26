@@ -11,15 +11,47 @@ fn ceil_log2(value: u32) -> u8 {
     (u32::BITS - (value - 1).leading_zeros()) as u8
 }
 
-fn merge_terrain_code_with_priority(current: u8, candidate: u8) -> u8 {
-    let current_priority = TerrainKind::from_code(current).priority();
-    let candidate_priority = TerrainKind::from_code(candidate).priority();
-
-    if candidate_priority > current_priority {
-        candidate
-    } else {
-        current
+fn lod_tie_break_priority(code: u8) -> u8 {
+    match TerrainKind::from_code(code) {
+        TerrainKind::Unknown => 0,
+        // Keep water low in LOD ties so rivers don't expand into oceans.
+        TerrainKind::Water => 1,
+        TerrainKind::Grass => 2,
+        TerrainKind::Farmland => 3,
+        TerrainKind::Forest => 4,
+        TerrainKind::Sand => 5,
+        TerrainKind::Urban => 6,
     }
+}
+
+fn resolve_downsampled_cell(samples: [u8; 4]) -> u8 {
+    let mut counts = [0_u8; 7];
+    for code in samples {
+        let bucket = usize::from(code.min(6));
+        counts[bucket] += 1;
+    }
+
+    let mut winner = DEFAULT_TERRAIN.code();
+    let mut winner_count = 0_u8;
+    let mut winner_tie_priority = lod_tie_break_priority(winner);
+
+    for (code, count) in counts.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+
+        let candidate = code as u8;
+        let candidate_tie_priority = lod_tie_break_priority(candidate);
+        if *count > winner_count
+            || (*count == winner_count && candidate_tie_priority > winner_tie_priority)
+        {
+            winner = candidate;
+            winner_count = *count;
+            winner_tie_priority = candidate_tie_priority;
+        }
+    }
+
+    winner
 }
 
 fn downsample_parent_tile(children: [Option<&Vec<u8>>; 4], cells_per_side: usize) -> Vec<u8> {
@@ -39,15 +71,11 @@ fn downsample_parent_tile(children: [Option<&Vec<u8>>; 4], cells_per_side: usize
             let child_base_x = (parent_x % child_half_side) * 2;
             let child_base_y = (parent_y % child_half_side) * 2;
 
-            let mut resolved = DEFAULT_TERRAIN.code();
-            for sample_y in 0..2 {
-                for sample_x in 0..2 {
-                    let source_index =
-                        (child_base_y + sample_y) * cells_per_side + (child_base_x + sample_x);
-                    resolved =
-                        merge_terrain_code_with_priority(resolved, child_cells[source_index]);
-                }
-            }
+            let sample00 = child_cells[child_base_y * cells_per_side + child_base_x];
+            let sample10 = child_cells[child_base_y * cells_per_side + (child_base_x + 1)];
+            let sample01 = child_cells[(child_base_y + 1) * cells_per_side + child_base_x];
+            let sample11 = child_cells[(child_base_y + 1) * cells_per_side + (child_base_x + 1)];
+            let resolved = resolve_downsampled_cell([sample00, sample10, sample01, sample11]);
 
             let target_index = parent_y * cells_per_side + parent_x;
             parent_cells[target_index] = resolved;
@@ -146,4 +174,31 @@ pub fn generate_tile_pyramid(
         playable_tile_offset_x,
         playable_tile_offset_y,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_prefers_majority_over_priority() {
+        let resolved = resolve_downsampled_cell([
+            TerrainKind::Water.code(),
+            TerrainKind::Grass.code(),
+            TerrainKind::Grass.code(),
+            TerrainKind::Grass.code(),
+        ]);
+        assert_eq!(resolved, TerrainKind::Grass.code());
+    }
+
+    #[test]
+    fn downsample_tie_does_not_bias_toward_water() {
+        let resolved = resolve_downsampled_cell([
+            TerrainKind::Water.code(),
+            TerrainKind::Water.code(),
+            TerrainKind::Grass.code(),
+            TerrainKind::Grass.code(),
+        ]);
+        assert_eq!(resolved, TerrainKind::Grass.code());
+    }
 }
