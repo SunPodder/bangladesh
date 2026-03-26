@@ -6,10 +6,10 @@
 - **Chunking**: The map is divided into $1km \times 1km$ spatial chunks for lazy loading.
 
 ## Data Pipeline
-- **Ingestion**: `build.rs` fetches PBF from Geofabrik/BBBike.
+- **Ingestion**: `map_gen` fetches PBF extracts from Geofabrik/BBBike.
 - **Processing (Terrain-first)**: `map_gen` parses terrain-relevant closed OSM ways (water/forest/urban/farmland/sand/grass), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
 - **Pyramid Bake**: `map_gen` now derives a sparse hierarchical tile pyramid from playable chunks (`zoom = playable..0`) by 2x downsampling each parent from 4 children.
-- **Storage**: Processed output is a single `assets/data/processed/{region}.world` file.
+- **Storage**: Map assets are unified in `assets/map/`: source `.pbf` and processed `.world` files are separated by extension in the same directory.
 - **Format**: `.world` stores compact metadata + tile index keyed by `(zoom, tile_x, tile_y)` + per-tile `rkyv` archived payloads.
 - **Runtime Loading**: Metadata is loaded first; terrain tiles are loaded on-demand by camera zoom + visible bounds. Full world file must never be loaded all at once.
 
@@ -26,10 +26,9 @@
 
 ## Repository Map
 - `src/main.rs`: Entry point. Handles CLI flags (`--server`, `--client`, `--host`).
-- `src/bin/map_gen.rs`: GIS Data Pipeline. Converts `.pbf` to game binary.
+- `src/bin/map_gen/`: Modular GIS pipeline binary (`main.rs` + focused submodules).
 - `src/plugins/`: Core logic split into `shared`, `client`, and `server`.
-- `assets/data/raw/`: Raw `.osm.pbf` files (ignored by git).
-- `assets/data/processed/`: Game-ready binary chunks.
+- `assets/map/`: Raw `.pbf` inputs and processed `.world` outputs.
 - `architecture.md`: High-level system design & networking specs.
 - `agent.md`: Detailed rules for AI coding behavior.
 

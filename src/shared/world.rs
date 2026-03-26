@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub const WORLD_MAGIC: &[u8; 8] = b"BDWORLD1";
 pub const WORLD_VERSION: u32 = 2;
 const WORLD_HEADER_SIZE: usize = 8 + 4 + 8;
+const MAP_ASSETS_DIR: &str = "assets/map";
 
 #[repr(u8)]
 #[derive(
@@ -130,8 +131,12 @@ pub struct WorldStreamReader {
     file: File,
 }
 
+pub fn map_assets_path() -> PathBuf {
+    Path::new(MAP_ASSETS_DIR).to_path_buf()
+}
+
 pub fn world_output_path(region: &str) -> PathBuf {
-    Path::new("assets/data/processed").join(format!("{region}.world"))
+    map_assets_path().join(format!("{region}.world"))
 }
 
 pub fn write_world_file(
