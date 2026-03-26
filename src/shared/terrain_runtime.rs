@@ -1,8 +1,10 @@
 use crate::shared::world::{
-    ArchivedTerrainChunk, TerrainKind, WorldStreamReader, world_output_path,
+    ArchivedTerrainTile, TerrainKind, WorldStreamReader, WorldIndex, world_output_path,
 };
 use anyhow::{Result, anyhow, ensure};
+use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 use rkyv::{access, rancor::Error as RkyvError};
 use std::collections::{HashMap, HashSet};
 
@@ -19,19 +21,27 @@ impl TerrainStreamingPlugin {
 #[derive(Resource, Clone)]
 struct TerrainRuntimeConfig {
     region: String,
-    load_radius: i32,
     movement_speed: f32,
+    zoom_lerp_speed: f32,
+    preload_margin_tiles: i32,
 }
 
 #[derive(Resource)]
 struct TerrainWorldState {
     reader: WorldStreamReader,
-    loaded_chunks: HashMap<(i32, i32), LoadedChunk>,
+    loaded_tiles: HashMap<(u8, i32, i32), LoadedTile>,
     cells_per_side: usize,
-    cell_size: f32,
+    playable_chunk_size_m: f32,
+    current_zoom_level: u8,
 }
 
-struct LoadedChunk {
+#[derive(Resource)]
+struct ZoomController {
+    target_zoom_level: u8,
+    target_scale: f32,
+}
+
+struct LoadedTile {
     _bytes: Vec<u8>,
     entities: Vec<Entity>,
 }
@@ -43,14 +53,22 @@ impl Plugin for TerrainStreamingPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(TerrainRuntimeConfig {
             region: self.region.clone(),
-            load_radius: 1,
             movement_speed: 900.0,
+            zoom_lerp_speed: 8.0,
+            preload_margin_tiles: 1,
         });
 
         app.add_systems(Startup, (setup_terrain_view, open_world).chain());
         app.add_systems(
             Update,
-            (move_player, follow_player_camera, stream_chunks_around_player),
+            (
+                move_player,
+                handle_zoom_input,
+                smooth_zoom_camera,
+                follow_player_camera,
+                update_map_lod,
+            )
+                .chain(),
         );
     }
 }
@@ -68,13 +86,13 @@ fn setup_terrain_view(mut commands: Commands) {
 fn open_world(
     mut commands: Commands,
     config: Res<TerrainRuntimeConfig>,
+    mut camera_query: Query<&mut Projection, With<Camera2d>>,
     mut player_query: Query<&mut Transform, With<StreamPlayer>>,
 ) {
     let world_path = world_output_path(&config.region);
 
     match WorldStreamReader::open(&world_path) {
         Ok(reader) => {
-            let cell_size = reader.index.chunk_size_m / f32::from(reader.index.cells_per_side);
             let start_x =
                 (reader.index.local_bounds_min_x + reader.index.local_bounds_max_x) * 0.5;
             let start_y =
@@ -86,16 +104,30 @@ fn open_world(
             }
 
             info!(
-                "Loaded world index for region '{}' ({} chunks)",
+                "Loaded world index for region '{}' ({} tiles across zoom 0..{})",
                 reader.index.region,
-                reader.index.chunks.len()
+                reader.index.tiles.len(),
+                reader.index.playable_zoom_level,
             );
 
+            if let Ok(mut projection) = camera_query.single_mut() {
+                if let Projection::Orthographic(ortho) = projection.as_mut() {
+                    ortho.scale = 1.0;
+                }
+            }
+
+            let playable_zoom_level = reader.index.playable_zoom_level;
             commands.insert_resource(TerrainWorldState {
                 cells_per_side: usize::from(reader.index.cells_per_side),
-                cell_size,
+                playable_chunk_size_m: reader.index.chunk_size_m,
                 reader,
-                loaded_chunks: HashMap::new(),
+                loaded_tiles: HashMap::new(),
+                current_zoom_level: playable_zoom_level,
+            });
+
+            commands.insert_resource(ZoomController {
+                target_zoom_level: playable_zoom_level,
+                target_scale: 1.0,
             });
         }
         Err(error) => {
@@ -141,6 +173,76 @@ fn move_player(
     transform.translation.y += movement.y;
 }
 
+fn handle_zoom_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut wheel_events: MessageReader<MouseWheel>,
+    zoom_controller: Option<ResMut<ZoomController>>,
+    state: Option<Res<TerrainWorldState>>,
+) {
+    let Some(mut zoom_controller) = zoom_controller else {
+        return;
+    };
+    let Some(state) = state else {
+        return;
+    };
+
+    let mut steps = 0_i32;
+    for event in wheel_events.read() {
+        if event.y > 0.0 {
+            steps += 1;
+        } else if event.y < 0.0 {
+            steps -= 1;
+        }
+    }
+
+    if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
+        steps += 1;
+    }
+    if keyboard.just_pressed(KeyCode::Minus) || keyboard.just_pressed(KeyCode::NumpadSubtract) {
+        steps -= 1;
+    }
+
+    if steps == 0 {
+        return;
+    }
+
+    let playable_zoom = i32::from(state.reader.index.playable_zoom_level);
+    let next_zoom = (i32::from(zoom_controller.target_zoom_level) + steps).clamp(0, playable_zoom);
+    zoom_controller.target_zoom_level = next_zoom as u8;
+    zoom_controller.target_scale = scale_for_zoom(
+        state.reader.index.playable_zoom_level,
+        zoom_controller.target_zoom_level,
+    );
+}
+
+fn smooth_zoom_camera(
+    time: Res<Time>,
+    config: Res<TerrainRuntimeConfig>,
+    zoom_controller: Option<Res<ZoomController>>,
+    mut camera_query: Query<&mut Projection, With<Camera2d>>,
+) {
+    let Some(zoom_controller) = zoom_controller else {
+        return;
+    };
+
+    let Ok(mut projection) = camera_query.single_mut() else {
+        return;
+    };
+
+    let Projection::Orthographic(ortho) = projection.as_mut() else {
+        return;
+    };
+
+    let alpha = 1.0 - (-config.zoom_lerp_speed * time.delta_secs()).exp();
+    let next_scale = ortho.scale + (zoom_controller.target_scale - ortho.scale) * alpha;
+
+    if (zoom_controller.target_scale - next_scale).abs() < 0.001 {
+        ortho.scale = zoom_controller.target_scale;
+    } else {
+        ortho.scale = next_scale;
+    }
+}
+
 fn follow_player_camera(
     player_query: Query<&Transform, With<StreamPlayer>>,
     mut camera_query: Query<&mut Transform, (With<Camera2d>, Without<StreamPlayer>)>,
@@ -157,114 +259,165 @@ fn follow_player_camera(
     camera_transform.translation.y = player_transform.translation.y;
 }
 
-fn stream_chunks_around_player(
+fn update_map_lod(
     mut commands: Commands,
     config: Res<TerrainRuntimeConfig>,
-    player_query: Query<&Transform, With<StreamPlayer>>,
+    camera_query: Query<(&Transform, &Projection), With<Camera2d>>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
     state: Option<ResMut<TerrainWorldState>>,
 ) {
     let Some(mut state) = state else {
         return;
     };
-    let Ok(player_transform) = player_query.single() else {
+
+    let Ok((camera_transform, camera_projection)) = camera_query.single() else {
         return;
     };
 
-    let chunk_size = state.reader.index.chunk_size_m;
-    let player_chunk_x = (player_transform.translation.x / chunk_size).floor() as i32;
-    let player_chunk_y = (player_transform.translation.y / chunk_size).floor() as i32;
+    let Projection::Orthographic(ortho_projection) = camera_projection else {
+        return;
+    };
 
-    let mut desired = HashSet::new();
-    for dy in -config.load_radius..=config.load_radius {
-        for dx in -config.load_radius..=config.load_radius {
-            let key = (player_chunk_x + dx, player_chunk_y + dy);
-            if state.reader.index.chunks.contains_key(&key) {
-                desired.insert(key);
+    let camera_scale = ortho_projection.scale;
+    let desired_zoom = scale_to_zoom(state.reader.index.playable_zoom_level, camera_scale);
+    state.current_zoom_level = desired_zoom;
+
+    let Ok(window) = window_query.single() else {
+        return;
+    };
+
+    let half_width = 0.5 * window.width() * camera_scale;
+    let half_height = 0.5 * window.height() * camera_scale;
+
+    let min_x = camera_transform.translation.x - half_width;
+    let max_x = camera_transform.translation.x + half_width;
+    let min_y = camera_transform.translation.y - half_height;
+    let max_y = camera_transform.translation.y + half_height;
+
+    let min_tile_x = world_to_tile_x(&state.reader.index, desired_zoom, min_x)
+        - config.preload_margin_tiles;
+    let max_tile_x = world_to_tile_x(&state.reader.index, desired_zoom, max_x)
+        + config.preload_margin_tiles;
+    let min_tile_y = world_to_tile_y(&state.reader.index, desired_zoom, min_y)
+        - config.preload_margin_tiles;
+    let max_tile_y = world_to_tile_y(&state.reader.index, desired_zoom, max_y)
+        + config.preload_margin_tiles;
+
+    let mut desired_tiles = HashSet::new();
+    for tile_y in min_tile_y..=max_tile_y {
+        for tile_x in min_tile_x..=max_tile_x {
+            let key = (desired_zoom, tile_x, tile_y);
+            if state.reader.index.tiles.contains_key(&key) {
+                desired_tiles.insert(key);
             }
         }
     }
 
-    let to_unload: Vec<(i32, i32)> = state
-        .loaded_chunks
+    let to_unload: Vec<(u8, i32, i32)> = state
+        .loaded_tiles
         .keys()
-        .filter(|chunk_key| !desired.contains(chunk_key))
+        .filter(|tile_key| !desired_tiles.contains(tile_key))
         .copied()
         .collect();
 
-    for chunk_key in to_unload {
-        if let Some(loaded_chunk) = state.loaded_chunks.remove(&chunk_key) {
-            for entity in loaded_chunk.entities {
+    for tile_key in to_unload {
+        if let Some(loaded_tile) = state.loaded_tiles.remove(&tile_key) {
+            for entity in loaded_tile.entities {
                 commands.entity(entity).despawn();
             }
         }
     }
 
-    let to_load: Vec<(i32, i32)> = desired
+    let to_load: Vec<(u8, i32, i32)> = desired_tiles
         .into_iter()
-        .filter(|chunk_key| !state.loaded_chunks.contains_key(chunk_key))
+        .filter(|tile_key| !state.loaded_tiles.contains_key(tile_key))
         .collect();
 
-    for (chunk_x, chunk_y) in to_load {
-        match state.reader.load_chunk_bytes(chunk_x, chunk_y) {
+    let playable_zoom = state.reader.index.playable_zoom_level;
+    let playable_tile_offset_x = state.reader.index.playable_tile_offset_x;
+    let playable_tile_offset_y = state.reader.index.playable_tile_offset_y;
+
+    for (zoom, tile_x, tile_y) in to_load {
+        match state.reader.load_tile_bytes(zoom, tile_x, tile_y) {
             Ok(Some(bytes)) => {
-                match spawn_chunk_entities(
+                match spawn_tile_entities(
                     &mut commands,
-                    state.cell_size,
+                    state.playable_chunk_size_m,
                     state.cells_per_side,
-                    chunk_x,
-                    chunk_y,
+                    playable_zoom,
+                    playable_tile_offset_x,
+                    playable_tile_offset_y,
+                    zoom,
+                    tile_x,
+                    tile_y,
                     &bytes,
                 ) {
                     Ok(entities) => {
-                        state
-                            .loaded_chunks
-                            .insert((chunk_x, chunk_y), LoadedChunk {
+                        state.loaded_tiles.insert(
+                            (zoom, tile_x, tile_y),
+                            LoadedTile {
                                 _bytes: bytes,
                                 entities,
-                            });
+                            },
+                        );
                     }
                     Err(error) => {
-                        error!("Failed to spawn chunk ({chunk_x}, {chunk_y}): {error}");
+                        error!("Failed to spawn tile ({zoom}, {tile_x}, {tile_y}): {error}");
                     }
                 }
             }
             Ok(None) => {}
             Err(error) => {
-                error!("Failed to load chunk ({chunk_x}, {chunk_y}): {error}");
+                error!("Failed to load tile ({zoom}, {tile_x}, {tile_y}): {error}");
             }
         }
     }
 }
 
-fn spawn_chunk_entities(
+fn spawn_tile_entities(
     commands: &mut Commands,
-    cell_size: f32,
+    playable_chunk_size_m: f32,
     cells_per_side: usize,
-    chunk_x: i32,
-    chunk_y: i32,
-    chunk_bytes: &[u8],
+    playable_zoom_level: u8,
+    playable_tile_offset_x: i32,
+    playable_tile_offset_y: i32,
+    zoom: u8,
+    tile_x: i32,
+    tile_y: i32,
+    tile_bytes: &[u8],
 ) -> Result<Vec<Entity>> {
-    let archived = access::<ArchivedTerrainChunk, RkyvError>(chunk_bytes)
-        .map_err(|err| anyhow!("failed to access archived terrain chunk: {err}"))?;
+    let archived = access::<ArchivedTerrainTile, RkyvError>(tile_bytes)
+        .map_err(|err| anyhow!("failed to access archived terrain tile: {err}"))?;
 
+    let archived_tile_x: i32 = archived.tile_x.into();
+    let archived_tile_y: i32 = archived.tile_y.into();
     ensure!(
-        archived.chunk_x == chunk_x && archived.chunk_y == chunk_y,
-        "chunk metadata mismatch while loading chunk"
+        u8::from(archived.zoom) == zoom
+            && archived_tile_x == tile_x
+            && archived_tile_y == tile_y,
+        "tile metadata mismatch while loading tile"
     );
 
     let expected_cells = cells_per_side * cells_per_side;
     ensure!(
         archived.cells.len() == expected_cells,
-        "chunk cell count mismatch: expected {expected_cells}, got {}",
+        "tile cell count mismatch: expected {expected_cells}, got {}",
         archived.cells.len()
     );
 
     let mut entities = Vec::with_capacity(expected_cells);
-    let chunk_size = cell_size * cells_per_side as f32;
-    let chunk_origin_x = chunk_x as f32 * chunk_size;
-    let chunk_origin_y = chunk_y as f32 * chunk_size;
+    let zoom_factor = 1_i32 << u32::from(playable_zoom_level - zoom);
+    let tile_size = playable_chunk_size_m * zoom_factor as f32;
+    let cell_size = tile_size / cells_per_side as f32;
 
-    for (index, terrain_code) in archived.cells.iter().copied().enumerate() {
+    let playable_tile_x = tile_x * zoom_factor;
+    let playable_tile_y = tile_y * zoom_factor;
+
+    let chunk_origin_x = (playable_tile_x - playable_tile_offset_x) as f32 * playable_chunk_size_m;
+    let chunk_origin_y = (playable_tile_y - playable_tile_offset_y) as f32 * playable_chunk_size_m;
+
+    for (index, terrain_code_le) in archived.cells.iter().enumerate() {
+        let terrain_code: u8 = (*terrain_code_le).into();
         let ix = (index % cells_per_side) as f32;
         let iy = (index / cells_per_side) as f32;
 
@@ -299,4 +452,35 @@ fn terrain_color(terrain: TerrainKind) -> Color {
         TerrainKind::Farmland => Color::srgb(0.60, 0.54, 0.22),
         TerrainKind::Sand => Color::srgb(0.80, 0.75, 0.52),
     }
+}
+
+fn scale_for_zoom(playable_zoom_level: u8, zoom_level: u8) -> f32 {
+    if zoom_level >= playable_zoom_level {
+        return 1.0;
+    }
+
+    let steps_out = i32::from(playable_zoom_level - zoom_level);
+    2.0_f32.powi(steps_out)
+}
+
+fn scale_to_zoom(playable_zoom_level: u8, scale: f32) -> u8 {
+    if scale <= 1.0 {
+        return playable_zoom_level;
+    }
+
+    let steps_out = scale.log2().round() as i32;
+    let zoom = i32::from(playable_zoom_level) - steps_out;
+    zoom.clamp(0, i32::from(playable_zoom_level)) as u8
+}
+
+fn world_to_tile_x(index: &WorldIndex, zoom_level: u8, world_x: f32) -> i32 {
+    let playable_x = (world_x / index.chunk_size_m).floor() as i32 + index.playable_tile_offset_x;
+    let factor = 1_i32 << u32::from(index.playable_zoom_level - zoom_level);
+    playable_x.div_euclid(factor)
+}
+
+fn world_to_tile_y(index: &WorldIndex, zoom_level: u8, world_y: f32) -> i32 {
+    let playable_y = (world_y / index.chunk_size_m).floor() as i32 + index.playable_tile_offset_y;
+    let factor = 1_i32 << u32::from(index.playable_zoom_level - zoom_level);
+    playable_y.div_euclid(factor)
 }

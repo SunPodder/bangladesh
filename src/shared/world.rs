@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const WORLD_MAGIC: &[u8; 8] = b"BDWORLD1";
-pub const WORLD_VERSION: u32 = 1;
+pub const WORLD_VERSION: u32 = 2;
 const WORLD_HEADER_SIZE: usize = 8 + 4 + 8;
 
 #[repr(u8)]
@@ -67,16 +67,18 @@ impl TerrainKind {
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct TerrainChunk {
-    pub chunk_x: i32,
-    pub chunk_y: i32,
+pub struct TerrainTile {
+    pub zoom: u8,
+    pub tile_x: i32,
+    pub tile_y: i32,
     pub cells: Vec<u8>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct ChunkMetadata {
-    pub chunk_x: i32,
-    pub chunk_y: i32,
+pub struct TileMetadata {
+    pub zoom: u8,
+    pub tile_x: i32,
+    pub tile_y: i32,
     pub byte_offset: u64,
     pub byte_len: u32,
 }
@@ -88,14 +90,17 @@ pub struct WorldMetadata {
     pub generated_unix_seconds: u64,
     pub chunk_size_m: f32,
     pub cells_per_side: u16,
+    pub playable_zoom_level: u8,
+    pub playable_tile_offset_x: i32,
+    pub playable_tile_offset_y: i32,
     pub mercator_origin_x_m: f64,
     pub mercator_origin_y_m: f64,
     pub local_bounds_min_x: f32,
     pub local_bounds_min_y: f32,
     pub local_bounds_max_x: f32,
     pub local_bounds_max_y: f32,
-    pub chunk_count: u32,
-    pub chunks: Vec<ChunkMetadata>,
+    pub tile_count: u32,
+    pub tiles: Vec<TileMetadata>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,11 +114,14 @@ pub struct WorldIndex {
     pub region: String,
     pub chunk_size_m: f32,
     pub cells_per_side: u16,
+    pub playable_zoom_level: u8,
+    pub playable_tile_offset_x: i32,
+    pub playable_tile_offset_y: i32,
     pub local_bounds_min_x: f32,
     pub local_bounds_min_y: f32,
     pub local_bounds_max_x: f32,
     pub local_bounds_max_y: f32,
-    pub chunks: HashMap<(i32, i32), ChunkLocation>,
+    pub tiles: HashMap<(u8, i32, i32), ChunkLocation>,
 }
 
 #[derive(Debug)]
@@ -129,36 +137,37 @@ pub fn world_output_path(region: &str) -> PathBuf {
 pub fn write_world_file(
     path: &Path,
     mut metadata: WorldMetadata,
-    chunks: Vec<TerrainChunk>,
+    tiles: Vec<TerrainTile>,
 ) -> Result<()> {
-    let mut serialized_chunks: Vec<(i32, i32, rkyv::util::AlignedVec)> =
-        Vec::with_capacity(chunks.len());
+    let mut serialized_tiles: Vec<(u8, i32, i32, rkyv::util::AlignedVec)> =
+        Vec::with_capacity(tiles.len());
 
-    for chunk in chunks {
-        let bytes = to_bytes::<RkyvError>(&chunk)
-            .map_err(|err| anyhow!("failed to serialize terrain chunk: {err}"))?;
-        serialized_chunks.push((chunk.chunk_x, chunk.chunk_y, bytes));
+    for tile in tiles {
+        let bytes = to_bytes::<RkyvError>(&tile)
+            .map_err(|err| anyhow!("failed to serialize terrain tile: {err}"))?;
+        serialized_tiles.push((tile.zoom, tile.tile_x, tile.tile_y, bytes));
     }
 
-    serialized_chunks.sort_by_key(|(x, y, _)| (*y, *x));
+    serialized_tiles.sort_by_key(|(zoom, x, y, _)| (*zoom, *y, *x));
 
-    metadata.chunks = serialized_chunks
+    metadata.tiles = serialized_tiles
         .iter()
-        .map(|(chunk_x, chunk_y, bytes)| ChunkMetadata {
-            chunk_x: *chunk_x,
-            chunk_y: *chunk_y,
+        .map(|(zoom, tile_x, tile_y, bytes)| TileMetadata {
+            zoom: *zoom,
+            tile_x: *tile_x,
+            tile_y: *tile_y,
             byte_offset: 0,
             byte_len: bytes.len() as u32,
         })
         .collect();
-    metadata.chunk_count = metadata.chunks.len() as u32;
+    metadata.tile_count = metadata.tiles.len() as u32;
 
     let probe_bytes = to_bytes::<RkyvError>(&metadata)
         .map_err(|err| anyhow!("failed to serialize world metadata (probe): {err}"))?;
     let metadata_len = probe_bytes.len() as u64;
 
     let mut current_offset = (WORLD_HEADER_SIZE as u64) + metadata_len;
-    for entry in &mut metadata.chunks {
+    for entry in &mut metadata.tiles {
         entry.byte_offset = current_offset;
         current_offset += u64::from(entry.byte_len);
     }
@@ -179,7 +188,7 @@ pub fn write_world_file(
     world_file.write_all(&(metadata_len).to_le_bytes())?;
     world_file.write_all(&metadata_bytes)?;
 
-    for (_, _, bytes) in serialized_chunks {
+    for (_, _, _, bytes) in serialized_tiles {
         world_file.write_all(&bytes)?;
     }
 
@@ -199,10 +208,14 @@ impl WorldStreamReader {
         let archived = access::<ArchivedWorldMetadata, RkyvError>(&metadata_bytes)
             .map_err(|err| anyhow!("failed to access archived world metadata: {err}"))?;
 
-        let mut chunks = HashMap::with_capacity(archived.chunks.len());
-        for entry in archived.chunks.iter() {
-            chunks.insert(
-                (entry.chunk_x.into(), entry.chunk_y.into()),
+        let mut tiles = HashMap::with_capacity(archived.tiles.len());
+        for entry in archived.tiles.iter() {
+            tiles.insert(
+                (
+                    entry.zoom.into(),
+                    entry.tile_x.into(),
+                    entry.tile_y.into(),
+                ),
                 ChunkLocation {
                     byte_offset: entry.byte_offset.into(),
                     byte_len: entry.byte_len.into(),
@@ -214,22 +227,26 @@ impl WorldStreamReader {
             region: archived.region.as_str().to_string(),
             chunk_size_m: archived.chunk_size_m.into(),
             cells_per_side: archived.cells_per_side.into(),
+            playable_zoom_level: archived.playable_zoom_level.into(),
+            playable_tile_offset_x: archived.playable_tile_offset_x.into(),
+            playable_tile_offset_y: archived.playable_tile_offset_y.into(),
             local_bounds_min_x: archived.local_bounds_min_x.into(),
             local_bounds_min_y: archived.local_bounds_min_y.into(),
             local_bounds_max_x: archived.local_bounds_max_x.into(),
             local_bounds_max_y: archived.local_bounds_max_y.into(),
-            chunks,
+            tiles,
         };
 
         Ok(Self { index, file })
     }
 
-    pub fn load_chunk_bytes(
+    pub fn load_tile_bytes(
         &mut self,
-        chunk_x: i32,
-        chunk_y: i32,
+        zoom: u8,
+        tile_x: i32,
+        tile_y: i32,
     ) -> Result<Option<Vec<u8>>> {
-        let Some(location) = self.index.chunks.get(&(chunk_x, chunk_y)).copied() else {
+        let Some(location) = self.index.tiles.get(&(zoom, tile_x, tile_y)).copied() else {
             return Ok(None);
         };
 
@@ -238,13 +255,15 @@ impl WorldStreamReader {
             .seek(SeekFrom::Start(location.byte_offset))
             .with_context(|| {
                 format!(
-                    "failed to seek to chunk ({chunk_x}, {chunk_y}) at {}",
+                    "failed to seek to tile ({zoom}, {tile_x}, {tile_y}) at {}",
                     location.byte_offset
                 )
             })?;
         self.file
             .read_exact(&mut data)
-            .with_context(|| format!("failed to read chunk ({chunk_x}, {chunk_y}) bytes"))?;
+            .with_context(|| {
+                format!("failed to read tile ({zoom}, {tile_x}, {tile_y}) bytes")
+            })?;
 
         Ok(Some(data))
     }

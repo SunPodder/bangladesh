@@ -8,9 +8,15 @@
 ## Data Pipeline
 - **Ingestion**: `build.rs` fetches PBF from Geofabrik/BBBike.
 - **Processing (Terrain-first)**: `map_gen` parses terrain-relevant closed OSM ways (water/forest/urban/farmland/sand/grass), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
+- **Pyramid Bake**: `map_gen` now derives a sparse hierarchical tile pyramid from playable chunks (`zoom = playable..0`) by 2x downsampling each parent from 4 children.
 - **Storage**: Processed output is a single `assets/data/processed/{region}.world` file.
-- **Format**: `.world` stores compact metadata + chunk index + per-chunk `rkyv` archived payloads.
-- **Runtime Loading**: Metadata is loaded first; terrain chunks are loaded on-demand by player chunk position. Full world file must never be loaded all at once.
+- **Format**: `.world` stores compact metadata + tile index keyed by `(zoom, tile_x, tile_y)` + per-tile `rkyv` archived payloads.
+- **Runtime Loading**: Metadata is loaded first; terrain tiles are loaded on-demand by camera zoom + visible bounds. Full world file must never be loaded all at once.
+
+## Zoom LOD
+- `playable_zoom_level` is the highest-detail terrain level (normal gameplay).
+- Lower zooms are unplayable overview layers that progressively drop detail but keep continuity.
+- Runtime converts camera scale -> zoom level and only keeps visible tiles (plus margin) resident.
 
 ## Networking (Server-Authoritative)
 - **Library**: `lightyear`.
