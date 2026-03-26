@@ -14,3 +14,6 @@
 - Always assume the server has the source of truth.
 - Local movement should use `lightyear`'s prediction components to eliminate perceived lag.
 - Use `FixedUpdate` for physics and gameplay logic to ensure deterministic behavior across different frame rates.
+
+## 4. Conversation Decisions
+- 2026-03-26: Implement terrain-only world processing first: parse OSM terrain polygons, archive chunk payloads with `rkyv`, write a single `{region}.world`, and stream chunk loading in Bevy strictly by player position.

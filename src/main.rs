@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use bangladesh::shared::terrain_runtime::TerrainStreamingPlugin;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -12,11 +13,23 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Mode {
     /// Host a local game (runs both client and server)
-    Host,
+    Host {
+        /// Processed world region id, e.g. bangladesh or dhaka
+        #[arg(short, long, default_value = "bangladesh")]
+        region: String,
+    },
     /// Run a dedicated server with no GUI
-    Server,
+    Server {
+        /// Processed world region id, e.g. bangladesh or dhaka
+        #[arg(short, long, default_value = "bangladesh")]
+        region: String,
+    },
     /// Connect to a remote server
-    Client,
+    Client {
+        /// Processed world region id, e.g. bangladesh or dhaka
+        #[arg(short, long, default_value = "bangladesh")]
+        region: String,
+    },
 }
 
 fn main() {
@@ -26,22 +39,23 @@ fn main() {
     let mut app = App::new();
     
     match cli.mode {
-        Mode::Host => {
+        Mode::Host { region } => {
             println!("Starting Local Host (Client + Server)...");
             // Typical setup for both hosting the game state locally and viewing it
-            app.add_plugins(DefaultPlugins);
+            app.add_plugins((DefaultPlugins, TerrainStreamingPlugin::new(region.clone())));
             app.add_systems(Startup, host_setup);
         },
-        Mode::Server => {
+        Mode::Server { region } => {
             println!("Starting Dedicated Server (No GUI)...");
+            println!("Headless mode selected for region: {region}");
             // MinimalPlugins allows running headless without windows/rendering
             app.add_plugins(MinimalPlugins);
             app.add_systems(Startup, server_setup);
         },
-        Mode::Client => {
+        Mode::Client { region } => {
             println!("Starting Game Client...");
             // GUI client for connecting to a remote server
-            app.add_plugins(DefaultPlugins);
+            app.add_plugins((DefaultPlugins, TerrainStreamingPlugin::new(region.clone())));
             app.add_systems(Startup, client_setup);
         }
     }

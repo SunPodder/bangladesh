@@ -1,5 +1,5 @@
 # Cargo Configuration
 [alias]
-dev = "run --bin bangladesh --features bevy/dynamic_linking"
+dev = "run --bin bangladesh --features bevy/dynamic_linking -- host"
 release = "run --release"
 map-gen = "run --bin map_gen"

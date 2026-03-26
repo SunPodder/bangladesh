@@ -7,11 +7,10 @@
 
 ## Data Pipeline
 - **Ingestion**: `build.rs` fetches PBF from Geofabrik/BBBike.
-- **Processing**: `map_gen` binary filters OSM tags:
-    - `building`: Prefilled structures (colliders).
-    - `highway`: Vehicle navigation paths.
-    - `landuse=grass/meadow`: Player build-zones.
-- **Storage**: Processed data is stored in `bincode` format for zero-cost deserialization.
+- **Processing (Terrain-first)**: `map_gen` parses terrain-relevant closed OSM ways (water/forest/urban/farmland/sand/grass), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
+- **Storage**: Processed output is a single `assets/data/processed/{region}.world` file.
+- **Format**: `.world` stores compact metadata + chunk index + per-chunk `rkyv` archived payloads.
+- **Runtime Loading**: Metadata is loaded first; terrain chunks are loaded on-demand by player chunk position. Full world file must never be loaded all at once.
 
 ## Networking (Server-Authoritative)
 - **Library**: `lightyear`.
