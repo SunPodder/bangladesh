@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     }
 
     println!("Parsing and processing terrain from {:?}", raw_file_path);
-    process_terrain_world(&args.region, &raw_file_path)?;
+    process_terrain_world(&args.region, &raw_file_path, args.cells_per_side)?;
     println!("Processing complete: {}", args.region);
 
     Ok(())

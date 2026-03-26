@@ -21,3 +21,5 @@
 - 2026-03-26: Refactor `map_gen` into modular submodules under `src/bin/map_gen/` to keep GIS processing maintainable while preserving ECS-friendly data boundaries.
 - 2026-03-26: Standardize map asset storage to `assets/map/` with `.pbf` and `.world` separated by extension, and default unresolved terrain areas to grass during bake/downsampling.
 - 2026-03-26: Fix LOD flood bug by replacing pyramid downsample priority-max merge with dominant-terrain voting and a water-safe tie break, and add `F3` runtime debug HUD for coords + zoom visibility.
+- 2026-03-26: Set GIS world scaling to 1:1 (`1m real = 1 world unit`) in `map_gen` via `GIS_TO_WORLD_SCALE = 1.0` and align architecture/instruction docs to the same invariant.
+- 2026-03-26: Fix narrow river extraction by ingesting terrain multipolygon relations (`type=multipolygon` outer ways) in `map_gen`, and expose raster detail via `--cells-per-side` so max playable zoom is not hard-capped by a compile-time constant.

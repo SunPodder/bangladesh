@@ -1,4 +1,4 @@
-use crate::constants::{CELLS_PER_SIDE, CHUNK_SIZE_METERS};
+use crate::constants::{CHUNK_SIZE_METERS, GIS_TO_WORLD_SCALE};
 use crate::geometry::compute_global_bounds;
 use crate::pyramid::generate_tile_pyramid;
 use crate::rasterize::rasterize_polygons;
@@ -8,7 +8,11 @@ use bangladesh::shared::world::{WorldMetadata, world_output_path, write_world_fi
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn process_terrain_world(region: &str, raw_file_path: &Path) -> Result<()> {
+pub fn process_terrain_world(region: &str, raw_file_path: &Path, cells_per_side: usize) -> Result<()> {
+    ensure!(cells_per_side >= 2, "cells_per_side must be at least 2");
+    ensure!(cells_per_side % 2 == 0, "cells_per_side must be even for 2x downsampling");
+    ensure!(u16::try_from(cells_per_side).is_ok(), "cells_per_side must fit into u16 metadata");
+
     println!("Scanning terrain ways from {:?}", raw_file_path);
     let (ways, needed_nodes) = collect_terrain_ways(raw_file_path)?;
     ensure!(
@@ -43,16 +47,19 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path) -> Result<()> {
 
     for polygon in &mut polygons {
         for point in &mut polygon.points {
-            point[0] -= mercator_origin_x;
-            point[1] -= mercator_origin_y;
+            point[0] = (point[0] - mercator_origin_x) * GIS_TO_WORLD_SCALE;
+            point[1] = (point[1] - mercator_origin_y) * GIS_TO_WORLD_SCALE;
         }
     }
 
     let local_bounds = compute_global_bounds(&polygons)
         .ok_or_else(|| anyhow!("failed to compute localized polygon bounds"))?;
 
-    println!("Rasterizing polygons into chunked terrain grid (rayon enabled)...");
-    let chunk_cells = rasterize_polygons(&polygons);
+    println!(
+        "Rasterizing polygons into chunked terrain grid (rayon enabled, {} cells/chunk side)...",
+        cells_per_side
+    );
+    let chunk_cells = rasterize_polygons(&polygons, cells_per_side);
     ensure!(
         !chunk_cells.is_empty(),
         "terrain rasterization produced no chunk cells"
@@ -60,7 +67,7 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path) -> Result<()> {
 
     println!("Building zoom pyramid tiles from playable chunks...");
     let (tiles, playable_zoom_level, playable_tile_offset_x, playable_tile_offset_y) =
-        generate_tile_pyramid(chunk_cells)?;
+        generate_tile_pyramid(chunk_cells, cells_per_side)?;
 
     println!(
         "Generated {} total tiles across zoom levels 0..{}",
@@ -78,7 +85,7 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path) -> Result<()> {
         source_pbf: raw_file_path.display().to_string(),
         generated_unix_seconds,
         chunk_size_m: CHUNK_SIZE_METERS as f32,
-        cells_per_side: CELLS_PER_SIDE as u16,
+        cells_per_side: cells_per_side as u16,
         playable_zoom_level,
         playable_tile_offset_x,
         playable_tile_offset_y,

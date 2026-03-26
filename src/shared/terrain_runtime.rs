@@ -150,6 +150,12 @@ fn open_world(
                 reader.index.tiles.len(),
                 reader.index.playable_zoom_level,
             );
+            info!(
+                "Playable terrain detail: {:.2}m per cell (chunk {:.1}m / {} cells)",
+                reader.index.chunk_size_m / f32::from(reader.index.cells_per_side),
+                reader.index.chunk_size_m,
+                reader.index.cells_per_side,
+            );
 
             if let Ok(mut projection) = camera_query.single_mut() {
                 if let Projection::Orthographic(ortho) = projection.as_mut() {

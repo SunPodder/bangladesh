@@ -1,4 +1,4 @@
-use crate::constants::{CELLS_PER_SIDE, CHUNK_SIZE_METERS, DEFAULT_TERRAIN};
+use crate::constants::{CHUNK_SIZE_METERS, DEFAULT_TERRAIN};
 use crate::geometry::{point_in_polygon, polygon_bounds};
 use crate::terrain_types::TerrainPolygon;
 use bangladesh::shared::world::TerrainKind;
@@ -7,10 +7,11 @@ use std::collections::HashMap;
 
 fn paint_polygon_into_chunks(
     polygon: &TerrainPolygon,
+    cells_per_side: usize,
     chunk_cells: &mut HashMap<(i32, i32), Vec<u8>>,
 ) {
     let bounds = polygon_bounds(&polygon.points);
-    let cell_size = CHUNK_SIZE_METERS / CELLS_PER_SIDE as f64;
+    let cell_size = CHUNK_SIZE_METERS / cells_per_side as f64;
 
     let min_chunk_x = (bounds.min_x / CHUNK_SIZE_METERS).floor() as i32;
     let max_chunk_x = (bounds.max_x / CHUNK_SIZE_METERS).floor() as i32;
@@ -27,17 +28,17 @@ fn paint_polygon_into_chunks(
 
             let min_ix = (((bounds.min_x - chunk_origin_x) / cell_size).floor() as i32).max(0);
             let max_ix = (((bounds.max_x - chunk_origin_x) / cell_size).ceil() as i32)
-                .min(CELLS_PER_SIDE as i32);
+                .min(cells_per_side as i32);
             let min_iy = (((bounds.min_y - chunk_origin_y) / cell_size).floor() as i32).max(0);
             let max_iy = (((bounds.max_y - chunk_origin_y) / cell_size).ceil() as i32)
-                .min(CELLS_PER_SIDE as i32);
+                .min(cells_per_side as i32);
 
             if min_ix >= max_ix || min_iy >= max_iy {
                 continue;
             }
 
             let cells = chunk_cells.entry((chunk_x, chunk_y)).or_insert_with(|| {
-                vec![DEFAULT_TERRAIN.code(); CELLS_PER_SIDE * CELLS_PER_SIDE]
+                vec![DEFAULT_TERRAIN.code(); cells_per_side * cells_per_side]
             });
 
             for iy in min_iy..max_iy {
@@ -49,7 +50,7 @@ fn paint_polygon_into_chunks(
                         continue;
                     }
 
-                    let index = (iy as usize) * CELLS_PER_SIDE + (ix as usize);
+                    let index = (iy as usize) * cells_per_side + (ix as usize);
                     let existing_priority = TerrainKind::from_code(cells[index]).priority();
                     if terrain_priority >= existing_priority {
                         cells[index] = terrain_code;
@@ -77,11 +78,14 @@ fn merge_chunk_maps(left: &mut HashMap<(i32, i32), Vec<u8>>, right: HashMap<(i32
     }
 }
 
-pub fn rasterize_polygons(polygons: &[TerrainPolygon]) -> HashMap<(i32, i32), Vec<u8>> {
+pub fn rasterize_polygons(
+    polygons: &[TerrainPolygon],
+    cells_per_side: usize,
+) -> HashMap<(i32, i32), Vec<u8>> {
     polygons
         .par_iter()
         .fold(HashMap::new, |mut local_map, polygon| {
-            paint_polygon_into_chunks(polygon, &mut local_map);
+            paint_polygon_into_chunks(polygon, cells_per_side, &mut local_map);
             local_map
         })
         .reduce(HashMap::new, |mut left, right| {

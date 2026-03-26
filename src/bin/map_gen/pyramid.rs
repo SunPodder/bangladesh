@@ -1,4 +1,4 @@
-use crate::constants::{CELLS_PER_SIDE, DEFAULT_TERRAIN};
+use crate::constants::DEFAULT_TERRAIN;
 use anyhow::{Result, anyhow, ensure};
 use bangladesh::shared::world::{TerrainKind, TerrainTile};
 use std::collections::{HashMap, HashSet};
@@ -87,13 +87,14 @@ fn downsample_parent_tile(children: [Option<&Vec<u8>>; 4], cells_per_side: usize
 
 pub fn generate_tile_pyramid(
     base_chunks: HashMap<(i32, i32), Vec<u8>>,
+    cells_per_side: usize,
 ) -> Result<(Vec<TerrainTile>, u8, i32, i32)> {
     ensure!(
         !base_chunks.is_empty(),
         "cannot build tile pyramid from an empty playable chunk set"
     );
     ensure!(
-        CELLS_PER_SIDE % 2 == 0,
+        cells_per_side % 2 == 0,
         "cells per side must be even for 2x downsampling"
     );
 
@@ -159,7 +160,7 @@ pub fn generate_tile_pyramid(
                 current_level.get(&(parent_x * 2 + 1, parent_y * 2 + 1)),
             ];
 
-            let parent_cells = downsample_parent_tile(children, CELLS_PER_SIDE);
+            let parent_cells = downsample_parent_tile(children, cells_per_side);
             next_level.insert((parent_x, parent_y), parent_cells);
         }
 

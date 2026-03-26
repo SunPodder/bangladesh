@@ -1,5 +1,5 @@
 # Project: Bangladesh RPG (OSM-GIS Native)
-An open-source, code-only 2D RPG of Bangladesh at 1:5 scale.
+An open-source, code-only 2D RPG of Bangladesh at 1:1 scale.
 
 ## Immediate Constraints
 - Use Bevy ECS patterns (Systems/Components). No OOP.

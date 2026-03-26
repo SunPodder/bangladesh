@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use crate::constants::DEFAULT_CELLS_PER_SIDE;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "OSM Data Downloader & Processor")]
@@ -12,6 +13,10 @@ pub struct Args {
     /// Force re-download even if file exists
     #[arg(short, long)]
     pub force: bool,
+
+    /// Terrain raster resolution per chunk side. Higher values improve detail but increase bake time and world size.
+    #[arg(long, default_value_t = DEFAULT_CELLS_PER_SIDE)]
+    pub cells_per_side: usize,
 }
 
 pub struct RegionConfig {

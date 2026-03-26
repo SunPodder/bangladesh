@@ -1,13 +1,14 @@
 # System Architecture
 
 ## World Scaling & GIS
-- **Scale**: 1:5 (1 real-meter = 0.2 game units).
+- **Scale**: 1:1 (1 real-meter = 1 game unit).
 - **Coordinate System**: WGS84 (Lat/Lon) projected to Web Mercator (EPSG:3857).
-- **Chunking**: The map is divided into $1km \times 1km$ spatial chunks for lazy loading.
+- **Chunking**: The map is divided into $1024m \times 1024m$ spatial chunks (about $1km^2$) for lazy loading.
 
 ## Data Pipeline
 - **Ingestion**: `map_gen` fetches PBF extracts from Geofabrik/BBBike.
-- **Processing (Terrain-first)**: `map_gen` parses terrain-relevant closed OSM ways (water/forest/urban/farmland/sand/grass), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
+- **Processing (Terrain-first)**: `map_gen` parses terrain tags from both closed OSM ways and `type=multipolygon` relations (outer way members stitched into rings), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
+- **Detail Resolution**: `map_gen` raster detail is configurable via `--cells-per-side` (even integer, default `64`), controlling max playable detail as $\text{cell size} = \frac{1024m}{\text{cells per side}}$.
 - **Pyramid Bake**: `map_gen` now derives a sparse hierarchical tile pyramid from playable chunks (`zoom = playable..0`) by 2x downsampling each parent from 4 children.
 - **Storage**: Map assets are unified in `assets/map/`: source `.pbf` and processed `.world` files are separated by extension in the same directory.
 - **Format**: `.world` stores compact metadata + tile index keyed by `(zoom, tile_x, tile_y)` + per-tile `rkyv` archived payloads.
