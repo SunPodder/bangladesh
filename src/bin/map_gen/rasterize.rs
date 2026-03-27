@@ -2,6 +2,7 @@ use crate::constants::{CHUNK_SIZE_METERS, DEFAULT_TERRAIN};
 use crate::geometry::{
     Bounds, point_in_polygon, polygon_bounds, polyline_bounds, squared_distance_point_to_segment,
 };
+use crate::procedural_refine::refine_chunk_cells;
 use crate::terrain_types::{RoadPolyline, TerrainPolygon};
 use anyhow::{Result, ensure};
 use bangladesh::shared::world::TerrainKind;
@@ -512,6 +513,8 @@ where
                             );
                         }
                     }
+
+                    refine_chunk_cells(&mut cells_buffer, cells_per_side);
 
                     (chunk_x, chunk_y, cells_buffer)
                 })

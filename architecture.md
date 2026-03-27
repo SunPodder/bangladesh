@@ -18,6 +18,7 @@
 - **Chunk Raster Windowing**: Rasterization now precomputes per-polygon chunk bounds, then processes bounded chunk-row windows in memory and emits finalized base tiles immediately; no global chunk->polygon map is retained.
 - **Parallel Chunk Rasterization**: Chunk cell computation now runs in Rayon workers with per-chunk local buffers in bounded batches; tile emission remains single-threaded and ordered to keep world writes deterministic and race-free.
 - **Raster Paint Order**: Per chunk, terrain polygons are painted first and roads are painted second; roads use higher terrain priority to remain visible over underlying land/water classes.
+- **Procedural Continuity Refinement**: After GIS raster paint, each chunk runs a deterministic local repair pass that bridges 1-cell road/water gaps, trims short dangling road stubs, removes tiny isolated road islands, and strengthens river-like water continuity while preserving chunk-edge continuations.
 - **In-Memory Pyramid Streaming**: Parent LOD levels are now reduced from streamed base rows in-memory (row-pair reducers per level), and each finalized parent tile is emitted directly to the world writer.
 - **Direct World Streaming Write**: `.world` generation now writes tile payloads directly to the final output file and appends metadata as a trailer pointer (world format v3), removing temporary tile spool files.
 - **Memory Strategy**: Raster memory is controlled by `--raster-memory-gib` (default `8`) and window sizing, keeping peak usage near the requested budget while preserving deterministic output ordering.

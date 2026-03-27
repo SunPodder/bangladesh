@@ -3,6 +3,7 @@ mod constants;
 mod download;
 mod geometry;
 mod process;
+mod procedural_refine;
 mod pyramid;
 mod rasterize;
 mod road_extract;
