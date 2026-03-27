@@ -1,14 +1,18 @@
 use anyhow::{Context, Result, anyhow, ensure};
+use indicatif::{ProgressBar, ProgressStyle};
 use rkyv::{Archive, Deserialize, Serialize, access, rancor::Error as RkyvError, to_bytes};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const WORLD_MAGIC: &[u8; 8] = b"BDWORLD1";
 pub const WORLD_VERSION: u32 = 2;
 const WORLD_HEADER_SIZE: usize = 8 + 4 + 8;
 const MAP_ASSETS_DIR: &str = "assets/map";
+static WORLD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[repr(u8)]
 #[derive(
@@ -118,6 +122,14 @@ pub struct WorldStreamReader {
     file: File,
 }
 
+#[derive(Debug)]
+pub struct WorldWriter {
+    temp_tile_data_path: PathBuf,
+    temp_tile_data_file: File,
+    tile_entries: Vec<TileMetadata>,
+    temp_tile_data_len: u64,
+}
+
 pub fn map_assets_path() -> PathBuf {
     Path::new(MAP_ASSETS_DIR).to_path_buf()
 }
@@ -128,63 +140,151 @@ pub fn world_output_path(region: &str) -> PathBuf {
 
 pub fn write_world_file(
     path: &Path,
-    mut metadata: WorldMetadata,
+    metadata: WorldMetadata,
     tiles: Vec<TerrainTile>,
 ) -> Result<()> {
-    let mut serialized_tiles: Vec<(u8, i32, i32, rkyv::util::AlignedVec)> =
-        Vec::with_capacity(tiles.len());
-
+    let mut writer = WorldWriter::new(path)?;
     for tile in tiles {
+        writer.write_tile(tile.zoom, tile.tile_x, tile.tile_y, tile.cells)?;
+    }
+    writer.finish(path, metadata)
+}
+
+impl WorldWriter {
+    pub fn new(output_path: &Path) -> Result<Self> {
+        let temp_tile_data_path = build_temp_tile_data_path(output_path);
+        let temp_tile_data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_tile_data_path)
+            .with_context(|| {
+                format!(
+                    "failed to create temporary world tile data file at {}",
+                    temp_tile_data_path.display()
+                )
+            })?;
+
+        Ok(Self {
+            temp_tile_data_path,
+            temp_tile_data_file,
+            tile_entries: Vec::new(),
+            temp_tile_data_len: 0,
+        })
+    }
+
+    pub fn write_tile(&mut self, zoom: u8, tile_x: i32, tile_y: i32, cells: Vec<u8>) -> Result<()> {
+        let tile = TerrainTile {
+            zoom,
+            tile_x,
+            tile_y,
+            cells,
+        };
+
         let bytes = to_bytes::<RkyvError>(&tile)
             .map_err(|err| anyhow!("failed to serialize terrain tile: {err}"))?;
-        serialized_tiles.push((tile.zoom, tile.tile_x, tile.tile_y, bytes));
-    }
+        ensure!(
+            u32::try_from(bytes.len()).is_ok(),
+            "serialized terrain tile is too large"
+        );
 
-    serialized_tiles.sort_by_key(|(zoom, x, y, _)| (*zoom, *y, *x));
+        self.temp_tile_data_file
+            .write_all(&bytes)
+            .context("failed to append serialized tile bytes to temporary world data")?;
 
-    metadata.tiles = serialized_tiles
-        .iter()
-        .map(|(zoom, tile_x, tile_y, bytes)| TileMetadata {
-            zoom: *zoom,
-            tile_x: *tile_x,
-            tile_y: *tile_y,
-            byte_offset: 0,
+        self.tile_entries.push(TileMetadata {
+            zoom,
+            tile_x,
+            tile_y,
+            byte_offset: self.temp_tile_data_len,
             byte_len: bytes.len() as u32,
-        })
-        .collect();
-    metadata.tile_count = metadata.tiles.len() as u32;
+        });
+        self.temp_tile_data_len += bytes.len() as u64;
 
-    let probe_bytes = to_bytes::<RkyvError>(&metadata)
-        .map_err(|err| anyhow!("failed to serialize world metadata (probe): {err}"))?;
-    let metadata_len = probe_bytes.len() as u64;
-
-    let mut current_offset = (WORLD_HEADER_SIZE as u64) + metadata_len;
-    for entry in &mut metadata.tiles {
-        entry.byte_offset = current_offset;
-        current_offset += u64::from(entry.byte_len);
+        Ok(())
     }
 
-    let metadata_bytes = to_bytes::<RkyvError>(&metadata)
-        .map_err(|err| anyhow!("failed to serialize world metadata: {err}"))?;
-
-    ensure!(
-        metadata_bytes.len() as u64 == metadata_len,
-        "serialized metadata size changed after offset patch"
-    );
-
-    let mut world_file = File::create(path)
-        .with_context(|| format!("failed to create world output at {}", path.display()))?;
-
-    world_file.write_all(WORLD_MAGIC)?;
-    world_file.write_all(&WORLD_VERSION.to_le_bytes())?;
-    world_file.write_all(&(metadata_len).to_le_bytes())?;
-    world_file.write_all(&metadata_bytes)?;
-
-    for (_, _, _, bytes) in serialized_tiles {
-        world_file.write_all(&bytes)?;
+    pub fn write_tile_from_slice(
+        &mut self,
+        zoom: u8,
+        tile_x: i32,
+        tile_y: i32,
+        cells: &[u8],
+    ) -> Result<()> {
+        self.write_tile(zoom, tile_x, tile_y, cells.to_vec())
     }
 
-    Ok(())
+    pub fn tile_count(&self) -> usize {
+        self.tile_entries.len()
+    }
+
+    pub fn finish(mut self, output_path: &Path, mut metadata: WorldMetadata) -> Result<()> {
+        metadata.tile_count = self.tile_entries.len() as u32;
+        metadata.tiles = self.tile_entries;
+
+        let probe_bytes = to_bytes::<RkyvError>(&metadata)
+            .map_err(|err| anyhow!("failed to serialize world metadata (probe): {err}"))?;
+        let metadata_len = probe_bytes.len() as u64;
+
+        let data_offset_base = (WORLD_HEADER_SIZE as u64) + metadata_len;
+        for entry in &mut metadata.tiles {
+            entry.byte_offset += data_offset_base;
+        }
+
+        let metadata_bytes = to_bytes::<RkyvError>(&metadata)
+            .map_err(|err| anyhow!("failed to serialize world metadata: {err}"))?;
+
+        ensure!(
+            metadata_bytes.len() as u64 == metadata_len,
+            "serialized metadata size changed after offset patch"
+        );
+
+        self.temp_tile_data_file
+            .flush()
+            .context("failed to flush temporary world tile bytes")?;
+        self.temp_tile_data_file
+            .seek(SeekFrom::Start(0))
+            .context("failed to rewind temporary world tile bytes")?;
+
+        let mut world_file = File::create(output_path).with_context(|| {
+            format!("failed to create world output at {}", output_path.display())
+        })?;
+
+        world_file.write_all(WORLD_MAGIC)?;
+        world_file.write_all(&WORLD_VERSION.to_le_bytes())?;
+        world_file.write_all(&(metadata_len).to_le_bytes())?;
+        world_file.write_all(&metadata_bytes)?;
+
+        let copy_progress = ProgressBar::new(self.temp_tile_data_len);
+        if let Ok(style) = ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.green/blue} {bytes}/{total_bytes} world data",
+        ) {
+            copy_progress.set_style(style.progress_chars("##-"));
+        }
+
+        let mut copy_buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let bytes_read = self
+                .temp_tile_data_file
+                .read(&mut copy_buffer)
+                .context("failed while reading temporary world tile data")?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            world_file
+                .write_all(&copy_buffer[..bytes_read])
+                .context("failed while writing streamed world tile data")?;
+            copy_progress.inc(bytes_read as u64);
+        }
+        copy_progress.finish_with_message("World file write complete");
+
+        drop(self.temp_tile_data_file);
+        let _ = std::fs::remove_file(&self.temp_tile_data_path);
+
+        Ok(())
+    }
 }
 
 impl WorldStreamReader {
@@ -275,4 +375,23 @@ fn read_header(file: &mut File) -> Result<u64> {
         .context("failed to read world metadata length")?;
 
     Ok(u64::from_le_bytes(metadata_len_buf))
+}
+
+fn build_temp_tile_data_path(output_path: &Path) -> PathBuf {
+    let stem = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("world");
+
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |duration| duration.as_nanos());
+    let unique_counter = WORLD_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    output_path.with_file_name(format!(
+        ".{stem}.{}.{}.{}.tiles.tmp",
+        std::process::id(),
+        unique_suffix,
+        unique_counter
+    ))
 }

@@ -21,4 +21,7 @@
 - Treat terrain LOD depth and camera zoom depth as separate concerns: LOD comes from baked tiles, camera zoom may go further while clamped to max LOD.
 - Prefer continuous camera zoom input with hysteresis-based LOD thresholding to keep zoom smooth while preventing rapid LOD thrashing.
 - Avoid synthetic tile subdivision that duplicates raster data; increase geometric detail through better source extraction or higher `--cells-per-side` instead.
+- For large map extracts, keep world generation streaming-first: do not collect the full tile pyramid or serialized world bytes in memory before writing.
+- Keep base raster generation chunk-streamed as well: avoid retaining `HashMap<(chunk_x, chunk_y), Vec<u8>>` for the whole map when processing large extracts.
+- Temporary streaming files that are written and later read must be opened with explicit read/write modes; avoid write-only descriptors in two-phase spool pipelines.
 
