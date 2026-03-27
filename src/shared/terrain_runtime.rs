@@ -78,7 +78,7 @@ impl Plugin for TerrainStreamingPlugin {
             zoom_wheel_sensitivity_steps: 0.25,
             lod_hysteresis_ratio: 0.10,
             preload_margin_tiles: 1,
-            playable_view_width_m: 96.0,
+            playable_view_width_m: 32.0,
             overview_padding_ratio: 1.08,
         });
         app.insert_resource(DebugOverlayState::default());
@@ -194,7 +194,7 @@ fn open_world(
             let playable_scale = scale_for_zoom_step(full_map_scale, max_zoom_step);
 
             let playable_zoom_level = reader.index.playable_zoom_level;
-            let lod_playable_scale = scale_for_zoom_step(full_map_scale, playable_zoom_level);
+            let lod_playable_scale = playable_scale;
 
             info!(
                 "Zoom profile: zoom-0 fits {:.0}m x {:.0}m (scale {:.5}), playable target {:.1}m across (step {}, scale {:.5})",
@@ -464,6 +464,7 @@ fn update_map_lod(
     let desired_zoom = select_lod_with_hysteresis(
         state.reader.index.playable_zoom_level,
         state.lod_playable_scale,
+        state.full_map_scale,
         camera_scale,
         state.current_zoom_level,
         config.lod_hysteresis_ratio,
@@ -683,26 +684,32 @@ fn zoom_progress_for_scale(full_map_scale: f32, scale: f32) -> f32 {
     (full_map_scale / safe_scale).log2().max(0.0)
 }
 
-fn scale_for_lod(playable_zoom_level: u8, zoom_level: u8, playable_lod_scale: f32) -> f32 {
-    let steps_out = i32::from(playable_zoom_level) - i32::from(zoom_level);
-    playable_lod_scale * 2.0_f32.powi(steps_out.max(0))
+fn scale_for_lod(playable_zoom_level: u8, zoom_level: u8, lod_playable_scale: f32, full_map_scale: f32) -> f32 {
+    let t = (i32::from(playable_zoom_level) - i32::from(zoom_level)).max(0) as f32
+        / f32::from(playable_zoom_level.max(1));
+    (lod_playable_scale.ln() * (1.0 - t) + full_map_scale.ln() * t).exp()
 }
 
 fn select_lod_with_hysteresis(
     playable_zoom_level: u8,
     playable_lod_scale: f32,
+    full_map_scale: f32,
     scale: f32,
     current_zoom_level: u8,
     hysteresis_ratio: f32,
 ) -> u8 {
     let mut zoom = i32::from(current_zoom_level).clamp(0, i32::from(playable_zoom_level));
     let hysteresis = (1.0 + hysteresis_ratio.max(0.0)).max(1.0);
-    let sqrt_two = std::f32::consts::SQRT_2;
+    
+    let lod_step_ratio = (full_map_scale / playable_lod_scale.max(1e-5))
+        .powf(1.0 / f32::from(playable_zoom_level.max(1)))
+        .max(1.001);
+    let mid_factor = lod_step_ratio.sqrt();
 
     for _ in 0..=playable_zoom_level {
-        let level_scale = scale_for_lod(playable_zoom_level, zoom as u8, playable_lod_scale);
-        let zoom_out_threshold = level_scale * sqrt_two * hysteresis;
-        let zoom_in_threshold = (level_scale / sqrt_two) / hysteresis;
+        let level_scale = scale_for_lod(playable_zoom_level, zoom as u8, playable_lod_scale, full_map_scale);
+        let zoom_out_threshold = level_scale * mid_factor * hysteresis;
+        let zoom_in_threshold = (level_scale / mid_factor) / hysteresis;
 
         if zoom > 0 && scale > zoom_out_threshold {
             zoom -= 1;

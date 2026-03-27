@@ -93,8 +93,8 @@ pub fn process_terrain_world(
         playable_zoom_level
     );
     println!(
-        "Playable tile size: {:.2}m (generator chunk {:.2}m)",
-        playable_tile_size_m, CHUNK_SIZE_METERS,
+        "Playable chunk size: {:.2}m (cell size: {:.2}m)",
+        playable_tile_size_m, playable_tile_size_m / cells_per_side as f32,
     );
 
     let generated_unix_seconds = SystemTime::now()
