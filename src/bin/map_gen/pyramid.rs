@@ -273,7 +273,7 @@ impl PyramidStreamReducer {
 fn lod_tie_break_priority(code: u8) -> u8 {
     match TerrainKind::from_code(code) {
         TerrainKind::Unknown => 0,
-        // Keep water low in LOD ties so rivers do not expand into oceans.
+        // Keep water low in generic LOD ties so rivers do not expand into oceans.
         TerrainKind::Water => 1,
         TerrainKind::Grass => 2,
         TerrainKind::Farmland => 3,
@@ -283,11 +283,34 @@ fn lod_tie_break_priority(code: u8) -> u8 {
     }
 }
 
+fn is_edge_connected_pair(mask: u8) -> bool {
+    const TOP_ROW: u8 = (1 << 0) | (1 << 1);
+    const BOTTOM_ROW: u8 = (1 << 2) | (1 << 3);
+    const LEFT_COL: u8 = (1 << 0) | (1 << 2);
+    const RIGHT_COL: u8 = (1 << 1) | (1 << 3);
+
+    matches!(mask, TOP_ROW | BOTTOM_ROW | LEFT_COL | RIGHT_COL)
+}
+
 fn resolve_downsampled_cell(samples: [u8; 4]) -> u8 {
     let mut counts = [0_u8; 7];
-    for code in samples {
+    let mut water_mask = 0_u8;
+    for (idx, code) in samples.into_iter().enumerate() {
+        if code == TerrainKind::Water.code() {
+            water_mask |= 1 << idx;
+        }
+
         let bucket = usize::from(code.min(6));
         counts[bucket] += 1;
+    }
+
+    let water_count = counts[usize::from(TerrainKind::Water.code())];
+    let max_count = counts.iter().copied().max().unwrap_or(0);
+
+    // Preserve broad river channels at low zoom: if a 2-2 tie includes
+    // edge-connected water samples, keep water for this parent cell.
+    if water_count == 2 && max_count == 2 && is_edge_connected_pair(water_mask) {
+        return TerrainKind::Water.code();
     }
 
     let mut winner = DEFAULT_TERRAIN.code();
@@ -360,12 +383,23 @@ mod tests {
     }
 
     #[test]
-    fn downsample_tie_does_not_bias_toward_water() {
+    fn downsample_edge_connected_water_tie_is_preserved() {
         let resolved = resolve_downsampled_cell([
             TerrainKind::Water.code(),
             TerrainKind::Water.code(),
             TerrainKind::Grass.code(),
             TerrainKind::Grass.code(),
+        ]);
+        assert_eq!(resolved, TerrainKind::Water.code());
+    }
+
+    #[test]
+    fn downsample_diagonal_water_tie_stays_land() {
+        let resolved = resolve_downsampled_cell([
+            TerrainKind::Water.code(),
+            TerrainKind::Grass.code(),
+            TerrainKind::Grass.code(),
+            TerrainKind::Water.code(),
         ]);
         assert_eq!(resolved, TerrainKind::Grass.code());
     }

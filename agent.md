@@ -28,6 +28,7 @@
 - Keep terrain tag classification aligned between ways and multipolygon relations; currently `building=*`, `amenity=*`, and `office=*` are treated as `Urban` hints unless a higher-priority terrain tag (for example `natural=water`) overrides.
 - Keep Bangladesh-local `landuse=*`, `leisure=*`, and `natural=*` variants in the terrain filters when unmatched fallback logs identify recurring values (for example `reservoir`, `slum`, `park`, `scrub`).
 - Keep tag-to-terrain mapping and best-match priority logic in `src/bin/map_gen/terrain_tag_filters.rs`; when default terrain fallback triggers, preserve logging of unmatched area-hint tags for filter expansion work.
+- In pyramid downsampling tie cases, preserve water only when a 2-2 tie forms an edge-connected strip (row/column) so major rivers remain visible in zoom 0 without letting diagonal/noisy water speckles spread.
 
 ## 5. Map-Gen Concurrency Safety
 - Parallelize terrain chunk cell computation with Rayon only when each worker writes to a chunk-local buffer.
