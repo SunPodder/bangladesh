@@ -13,9 +13,16 @@ pub fn classify_tag_pair(key: &str, value: &str) -> Option<TerrainKind> {
         | ("natural", "wetland")
         | ("natural", "bay")
         | ("natural", "coastline")
-        | ("waterway", "riverbank") => Some(TerrainKind::Water),
+        | ("waterway", "riverbank")
+        | ("landuse", "reservoir")
+        | ("leisure", "swimming_area") => Some(TerrainKind::Water),
 
-        ("landuse", "forest") | ("natural", "wood") | ("landuse", "wood") => {
+        ("landuse", "forest")
+        | ("natural", "wood")
+        | ("landuse", "wood")
+        | ("natural", "heath")
+        | ("natural", "scrub")
+        | ("natural", "tree_row") => {
             Some(TerrainKind::Forest)
         }
 
@@ -24,11 +31,32 @@ pub fn classify_tag_pair(key: &str, value: &str) -> Option<TerrainKind> {
         | ("landuse", "industrial")
         | ("landuse", "retail")
         | ("landuse", "construction")
+        | ("landuse", "brownfield")
+        | ("landuse", "depot")
+        | ("landuse", "Dhaka Woasa")
+        | ("landuse", "education")
+        | ("landuse", "garages")
+        | ("landuse", "landfill")
+        | ("landuse", "military")
+        | ("landuse", "religious")
+        | ("landuse", "slam")
+        | ("landuse", "slum")
+        | ("landuse", "yes")
         | ("building", _)
         | ("amenity", _)
-        | ("office", _) => Some(TerrainKind::Urban),
+        | ("office", _)
+        | ("leisure", "bleachers")
+        | ("leisure", "fitness_station")
+        | ("leisure", "outdoor_seating")
+        | ("leisure", "resort")
+        | ("leisure", "slipway")
+        | ("leisure", "sports_centre")
+        | ("leisure", "stadium")
+        | ("leisure", "swimming_pool") => Some(TerrainKind::Urban),
 
         ("landuse", "farmland")
+        | ("landuse", "allotments")
+        | ("landuse", "farmyard")
         | ("landuse", "orchard")
         | ("landuse", "vineyard")
         | ("landuse", "greenhouse_horticulture")
@@ -41,7 +69,26 @@ pub fn classify_tag_pair(key: &str, value: &str) -> Option<TerrainKind> {
         | ("landuse", "meadow")
         | ("landuse", "village_green")
         | ("landuse", "recreation_ground")
-        | ("natural", "grassland") => Some(TerrainKind::Grass),
+        | ("landuse", "cemetery")
+        | ("landuse", "churchyard")
+        | ("landuse", "common")
+        | ("landuse", "flowerbed")
+        | ("landuse", "greenfield")
+        | ("landuse", "open space")
+        | ("landuse", "open_space")
+        | ("landuse", "playground")
+        | ("leisure", "common")
+        | ("leisure", "garden")
+        | ("leisure", "golf_course")
+        | ("leisure", "open space")
+        | ("leisure", "Open space")
+        | ("leisure", "park")
+        | ("leisure", "pitch")
+        | ("leisure", "playground")
+        | ("leisure", "practice_pitch")
+        | ("leisure", "track")
+        | ("natural", "grassland")
+        | ("natural", "yes") => Some(TerrainKind::Grass),
 
         _ => None,
     }

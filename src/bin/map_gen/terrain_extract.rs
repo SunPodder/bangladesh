@@ -19,7 +19,6 @@ where
     I: Iterator<Item = (&'a str, &'a str)>,
 {
     let tag_pairs: Vec<(&str, &str)> = tags.collect();
-
     if let Some(best_match) = best_terrain_match(tag_pairs.iter().copied()) {
         return Some(best_match);
     }
@@ -38,7 +37,7 @@ where
         );
         Some(DEFAULT_TERRAIN)
     } else {
-        None
+        Some(DEFAULT_TERRAIN)
     }
 }
 

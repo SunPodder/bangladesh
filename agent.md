@@ -26,6 +26,7 @@
 - Prefer bounded in-memory row/window reducers over temporary spool files for pyramid/raster stages; keep tile emission ordered by `(tile_y, tile_x)` for deterministic output.
 - Respect `--raster-memory-gib` as the raster window budget control when tuning large-area generation stability.
 - Keep terrain tag classification aligned between ways and multipolygon relations; currently `building=*`, `amenity=*`, and `office=*` are treated as `Urban` hints unless a higher-priority terrain tag (for example `natural=water`) overrides.
+- Keep Bangladesh-local `landuse=*`, `leisure=*`, and `natural=*` variants in the terrain filters when unmatched fallback logs identify recurring values (for example `reservoir`, `slum`, `park`, `scrub`).
 - Keep tag-to-terrain mapping and best-match priority logic in `src/bin/map_gen/terrain_tag_filters.rs`; when default terrain fallback triggers, preserve logging of unmatched area-hint tags for filter expansion work.
 
 ## 5. Map-Gen Concurrency Safety
