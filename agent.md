@@ -25,3 +25,8 @@
 - Keep base raster generation chunk-streamed as well: avoid retaining `HashMap<(chunk_x, chunk_y), Vec<u8>>` for the whole map when processing large extracts.
 - Temporary streaming files that are written and later read must be opened with explicit read/write modes; avoid write-only descriptors in two-phase spool pipelines.
 
+## 5. Map-Gen Concurrency Safety
+- Parallelize terrain chunk cell computation with Rayon only when each worker writes to a chunk-local buffer.
+- Keep final tile emission and world/spool writes single-threaded and deterministic (sorted chunk order).
+- Use bounded batch sizes for parallel compute stages before sequential IO emission to prevent unbounded memory growth.
+

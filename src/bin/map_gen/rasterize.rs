@@ -4,6 +4,7 @@ use crate::terrain_types::TerrainPolygon;
 use anyhow::Result;
 use bangladesh::shared::world::TerrainKind;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 pub struct RasterChunkIndex {
@@ -164,28 +165,43 @@ where
     }
 
     let default_code = DEFAULT_TERRAIN.code();
-    let mut cells_buffer = vec![default_code; cells_per_side * cells_per_side];
+    let cells_per_chunk = cells_per_side * cells_per_side;
 
-    for (chunk_x, chunk_y) in chunk_keys {
-        cells_buffer.fill(default_code);
+    // Process bounded batches in parallel to keep memory stable while retaining deterministic
+    // single-thread tile emission into the world/spool writers.
+    let worker_count = rayon::current_num_threads().max(1);
+    let batch_size = (worker_count * 4).max(1);
 
-        if let Some(polygon_indices) = chunk_index.chunk_polygons.get(&(chunk_x, chunk_y)) {
-            for polygon_idx in polygon_indices {
-                let polygon = &polygons[*polygon_idx];
-                let bounds = chunk_index.polygon_bounds(*polygon_idx);
-                paint_polygon_into_chunk(
-                    polygon,
-                    bounds,
-                    chunk_x,
-                    chunk_y,
-                    cells_per_side,
-                    &mut cells_buffer,
-                );
-            }
+    for chunk_batch in chunk_keys.chunks(batch_size) {
+        let rasterized_batch = chunk_batch
+            .par_iter()
+            .copied()
+            .map(|(chunk_x, chunk_y)| {
+                let mut cells_buffer = vec![default_code; cells_per_chunk];
+
+                if let Some(polygon_indices) = chunk_index.chunk_polygons.get(&(chunk_x, chunk_y)) {
+                    for polygon_idx in polygon_indices {
+                        let polygon = &polygons[*polygon_idx];
+                        let bounds = chunk_index.polygon_bounds(*polygon_idx);
+                        paint_polygon_into_chunk(
+                            polygon,
+                            bounds,
+                            chunk_x,
+                            chunk_y,
+                            cells_per_side,
+                            &mut cells_buffer,
+                        );
+                    }
+                }
+
+                (chunk_x, chunk_y, cells_buffer)
+            })
+            .collect::<Vec<_>>();
+
+        for (chunk_x, chunk_y, cells) in rasterized_batch {
+            emit_chunk(chunk_x, chunk_y, &cells)?;
+            progress.inc(1);
         }
-
-        emit_chunk(chunk_x, chunk_y, &cells_buffer)?;
-        progress.inc(1);
     }
 
     progress.finish_with_message("Chunk rasterization stream complete");

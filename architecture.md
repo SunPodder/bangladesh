@@ -11,6 +11,7 @@
 - **Detail Resolution**: `map_gen` raster detail is configurable via `--cells-per-side` (even integer, default `256`), controlling max playable detail as $\text{cell size} = \frac{1024m}{\text{cells per side}}$.
 - **Pyramid Bake**: `map_gen` derives a sparse hierarchical tile pyramid from real raster chunks only (`zoom = playable..0`) by 2x downsampling each parent from 4 children. No synthetic detail subdivision is generated.
 - **Chunk Raster Streaming**: Rasterization now builds a polygon->chunk index and then rasterizes one chunk at a time with a reusable fixed cell buffer; full base chunk-cell maps are no longer kept in memory.
+- **Parallel Chunk Rasterization**: Chunk cell computation now runs in Rayon workers with per-chunk local buffers in bounded batches; tile emission remains single-threaded and ordered to keep world writes deterministic and race-free.
 - **Disk-Backed Pyramid Streaming**: Base tiles are spooled to a temporary level file, and parent levels are generated row-pair-at-a-time from that spool into the final world writer. Peak memory is bounded to row working sets instead of whole zoom levels.
 - **Streaming World Write**: `map_gen` streams tiles into a temporary world tile-data spool and finalizes `.world` metadata afterward, avoiding in-memory accumulation of serialized tile bytes.
 - **Memory Strategy**: Final world assembly uses a fixed reusable copy buffer when committing tile data to the output file, trading throughput for predictable memory bounds.
