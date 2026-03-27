@@ -5,6 +5,7 @@ mod geometry;
 mod process;
 mod pyramid;
 mod rasterize;
+mod road_extract;
 mod terrain_extract;
 mod terrain_tag_filters;
 mod terrain_types;

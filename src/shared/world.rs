@@ -24,6 +24,7 @@ pub enum TerrainKind {
     Urban = 4,
     Farmland = 5,
     Sand = 6,
+    Road = 7,
 }
 
 impl TerrainKind {
@@ -35,6 +36,7 @@ impl TerrainKind {
             4 => Self::Urban,
             5 => Self::Farmland,
             6 => Self::Sand,
+            7 => Self::Road,
             _ => Self::Unknown,
         }
     }
@@ -52,6 +54,7 @@ impl TerrainKind {
             Self::Sand => 4,
             Self::Urban => 5,
             Self::Water => 6,
+            Self::Road => 7,
         }
     }
 }

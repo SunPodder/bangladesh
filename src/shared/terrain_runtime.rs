@@ -639,6 +639,7 @@ fn terrain_color(terrain: TerrainKind) -> Color {
         TerrainKind::Urban => Color::srgb(0.47, 0.43, 0.40),
         TerrainKind::Farmland => Color::srgb(0.60, 0.54, 0.22),
         TerrainKind::Sand => Color::srgb(0.80, 0.75, 0.52),
+        TerrainKind::Road => Color::srgb(0.16, 0.16, 0.17),
     }
 }
 

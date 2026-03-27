@@ -1,6 +1,8 @@
 use crate::constants::{CHUNK_SIZE_METERS, DEFAULT_TERRAIN};
-use crate::geometry::{Bounds, point_in_polygon, polygon_bounds};
-use crate::terrain_types::TerrainPolygon;
+use crate::geometry::{
+    Bounds, point_in_polygon, polygon_bounds, polyline_bounds, squared_distance_point_to_segment,
+};
+use crate::terrain_types::{RoadPolyline, TerrainPolygon};
 use anyhow::{Result, ensure};
 use bangladesh::shared::world::TerrainKind;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -30,15 +32,15 @@ pub struct RasterChunkIndex {
     polygon_chunk_bounds: Vec<PolygonChunkBounds>,
 }
 
+pub struct RasterRoadIndex {
+    pub min_chunk_x: i32,
+    pub min_chunk_y: i32,
+    pub max_chunk_x: i32,
+    pub max_chunk_y: i32,
+    road_chunk_bounds: Vec<PolygonChunkBounds>,
+}
+
 impl RasterChunkIndex {
-    pub fn chunk_span_width(&self) -> usize {
-        (self.max_chunk_x - self.min_chunk_x + 1).max(0) as usize
-    }
-
-    pub fn chunk_span_height(&self) -> usize {
-        (self.max_chunk_y - self.min_chunk_y + 1).max(0) as usize
-    }
-
     pub fn is_empty(&self) -> bool {
         self.polygon_bounds.is_empty()
     }
@@ -49,6 +51,16 @@ impl RasterChunkIndex {
 
     pub fn polygon_chunk_bounds(&self, polygon_idx: usize) -> PolygonChunkBounds {
         self.polygon_chunk_bounds[polygon_idx]
+    }
+}
+
+impl RasterRoadIndex {
+    pub fn is_empty(&self) -> bool {
+        self.road_chunk_bounds.is_empty()
+    }
+
+    pub fn road_chunk_bounds(&self, road_idx: usize) -> PolygonChunkBounds {
+        self.road_chunk_bounds[road_idx]
     }
 }
 
@@ -97,6 +109,87 @@ fn paint_polygon_into_chunk(
     }
 }
 
+fn expand_bounds(bounds: Bounds, radius_m: f64) -> Bounds {
+    Bounds {
+        min_x: bounds.min_x - radius_m,
+        min_y: bounds.min_y - radius_m,
+        max_x: bounds.max_x + radius_m,
+        max_y: bounds.max_y + radius_m,
+    }
+}
+
+fn chunk_bounds_from_bounds(bounds: Bounds) -> PolygonChunkBounds {
+    PolygonChunkBounds {
+        min_chunk_x: (bounds.min_x / CHUNK_SIZE_METERS).floor() as i32,
+        max_chunk_x: (bounds.max_x / CHUNK_SIZE_METERS).floor() as i32,
+        min_chunk_y: (bounds.min_y / CHUNK_SIZE_METERS).floor() as i32,
+        max_chunk_y: (bounds.max_y / CHUNK_SIZE_METERS).floor() as i32,
+    }
+}
+
+fn paint_road_into_chunk(
+    road: &RoadPolyline,
+    chunk_x: i32,
+    chunk_y: i32,
+    cells_per_side: usize,
+    cells: &mut [u8],
+) {
+    let cell_size = CHUNK_SIZE_METERS / cells_per_side as f64;
+    let half_width = (road.width_m * 0.5).max(cell_size * 0.45);
+    let width_sq = half_width * half_width;
+
+    let terrain_code = TerrainKind::Road.code();
+    let terrain_priority = TerrainKind::Road.priority();
+
+    let chunk_origin_x = f64::from(chunk_x) * CHUNK_SIZE_METERS;
+    let chunk_origin_y = f64::from(chunk_y) * CHUNK_SIZE_METERS;
+
+    for segment in road.points.windows(2) {
+        let start = segment[0];
+        let end = segment[1];
+        let expanded_segment_bounds = expand_bounds(
+            Bounds {
+                min_x: start[0].min(end[0]),
+                min_y: start[1].min(end[1]),
+                max_x: start[0].max(end[0]),
+                max_y: start[1].max(end[1]),
+            },
+            half_width,
+        );
+
+        let min_ix = (((expanded_segment_bounds.min_x - chunk_origin_x) / cell_size).floor() as i32)
+            .max(0);
+        let max_ix = (((expanded_segment_bounds.max_x - chunk_origin_x) / cell_size).ceil() as i32)
+            .min(cells_per_side as i32);
+        let min_iy = (((expanded_segment_bounds.min_y - chunk_origin_y) / cell_size).floor() as i32)
+            .max(0);
+        let max_iy = (((expanded_segment_bounds.max_y - chunk_origin_y) / cell_size).ceil() as i32)
+            .min(cells_per_side as i32);
+
+        if min_ix >= max_ix || min_iy >= max_iy {
+            continue;
+        }
+
+        for iy in min_iy..max_iy {
+            for ix in min_ix..max_ix {
+                let world_x = chunk_origin_x + (f64::from(ix) + 0.5) * cell_size;
+                let world_y = chunk_origin_y + (f64::from(iy) + 0.5) * cell_size;
+
+                if squared_distance_point_to_segment([world_x, world_y], start, end) > width_sq {
+                    continue;
+                }
+
+                let index = (iy as usize) * cells_per_side + (ix as usize);
+                let existing_priority = TerrainKind::from_code(cells[index]).priority();
+                if terrain_priority >= existing_priority {
+                    cells[index] = terrain_code;
+                }
+            }
+        }
+    }
+
+}
+
 pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkIndex {
     let mut polygon_bounds_cache = Vec::with_capacity(polygons.len());
     let mut polygon_chunk_bounds = Vec::with_capacity(polygons.len());
@@ -117,12 +210,7 @@ pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkInde
         let bounds = polygon_bounds(&polygon.points);
         polygon_bounds_cache.push(bounds);
 
-        let chunk_bounds = PolygonChunkBounds {
-            min_chunk_x: (bounds.min_x / CHUNK_SIZE_METERS).floor() as i32,
-            max_chunk_x: (bounds.max_x / CHUNK_SIZE_METERS).floor() as i32,
-            min_chunk_y: (bounds.min_y / CHUNK_SIZE_METERS).floor() as i32,
-            max_chunk_y: (bounds.max_y / CHUNK_SIZE_METERS).floor() as i32,
-        };
+        let chunk_bounds = chunk_bounds_from_bounds(bounds);
         polygon_chunk_bounds.push(chunk_bounds);
 
         min_chunk_x = min_chunk_x.min(chunk_bounds.min_chunk_x);
@@ -157,6 +245,57 @@ pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkInde
     }
 }
 
+pub fn build_chunk_road_index(roads: &[RoadPolyline]) -> RasterRoadIndex {
+    let mut road_chunk_bounds = Vec::with_capacity(roads.len());
+
+    let mut min_chunk_x = i32::MAX;
+    let mut min_chunk_y = i32::MAX;
+    let mut max_chunk_x = i32::MIN;
+    let mut max_chunk_y = i32::MIN;
+
+    let progress = ProgressBar::new(roads.len() as u64);
+    if let Ok(style) =
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.green/blue} {pos}/{len} roads")
+    {
+        progress.set_style(style.progress_chars("##-"));
+    }
+
+    for road in roads {
+        let bounds = polyline_bounds(&road.points);
+        let expanded_bounds = expand_bounds(bounds, road.width_m * 0.5);
+
+        let chunk_bounds = chunk_bounds_from_bounds(expanded_bounds);
+        road_chunk_bounds.push(chunk_bounds);
+
+        min_chunk_x = min_chunk_x.min(chunk_bounds.min_chunk_x);
+        min_chunk_y = min_chunk_y.min(chunk_bounds.min_chunk_y);
+        max_chunk_x = max_chunk_x.max(chunk_bounds.max_chunk_x);
+        max_chunk_y = max_chunk_y.max(chunk_bounds.max_chunk_y);
+
+        progress.inc(1);
+    }
+
+    progress.finish_with_message("Road-to-chunk indexing complete");
+
+    if roads.is_empty() {
+        return RasterRoadIndex {
+            min_chunk_x: 0,
+            min_chunk_y: 0,
+            max_chunk_x: -1,
+            max_chunk_y: -1,
+            road_chunk_bounds,
+        };
+    }
+
+    RasterRoadIndex {
+        min_chunk_x,
+        min_chunk_y,
+        max_chunk_x,
+        max_chunk_y,
+        road_chunk_bounds,
+    }
+}
+
 fn estimate_window_rows(
     cells_per_side: usize,
     span_width: usize,
@@ -176,6 +315,8 @@ fn estimate_window_rows(
 pub fn stream_rasterized_chunks<F>(
     polygons: &[TerrainPolygon],
     chunk_index: &RasterChunkIndex,
+    roads: &[RoadPolyline],
+    road_index: &RasterRoadIndex,
     cells_per_side: usize,
     raster_memory_budget_bytes: u64,
     emit_chunk: F,
@@ -190,12 +331,41 @@ where
 
     let mut emit_chunk = emit_chunk;
 
-    if chunk_index.is_empty() {
+    if chunk_index.is_empty() && road_index.is_empty() {
         return Ok(0);
     }
 
-    let span_width = chunk_index.chunk_span_width();
-    let span_height = chunk_index.chunk_span_height();
+    let min_chunk_x = if chunk_index.is_empty() {
+        road_index.min_chunk_x
+    } else if road_index.is_empty() {
+        chunk_index.min_chunk_x
+    } else {
+        chunk_index.min_chunk_x.min(road_index.min_chunk_x)
+    };
+    let min_chunk_y = if chunk_index.is_empty() {
+        road_index.min_chunk_y
+    } else if road_index.is_empty() {
+        chunk_index.min_chunk_y
+    } else {
+        chunk_index.min_chunk_y.min(road_index.min_chunk_y)
+    };
+    let max_chunk_x = if chunk_index.is_empty() {
+        road_index.max_chunk_x
+    } else if road_index.is_empty() {
+        chunk_index.max_chunk_x
+    } else {
+        chunk_index.max_chunk_x.max(road_index.max_chunk_x)
+    };
+    let max_chunk_y = if chunk_index.is_empty() {
+        road_index.max_chunk_y
+    } else if road_index.is_empty() {
+        chunk_index.max_chunk_y
+    } else {
+        chunk_index.max_chunk_y.max(road_index.max_chunk_y)
+    };
+
+    let span_width = (max_chunk_x - min_chunk_x + 1).max(0) as usize;
+    let span_height = (max_chunk_y - min_chunk_y + 1).max(0) as usize;
     let window_rows = estimate_window_rows(cells_per_side, span_width, raster_memory_budget_bytes);
     let total_windows = span_height.div_ceil(window_rows);
 
@@ -215,17 +385,22 @@ where
         chunk_index.polygon_chunk_bounds(*polygon_idx).min_chunk_y
     });
 
+    let mut roads_by_min_y = (0..roads.len()).collect::<Vec<_>>();
+    roads_by_min_y.sort_unstable_by_key(|road_idx| road_index.road_chunk_bounds(*road_idx).min_chunk_y);
+
     let mut next_polygon_cursor = 0_usize;
+    let mut next_road_cursor = 0_usize;
     let mut active_polygons = Vec::new();
+    let mut active_roads = Vec::new();
 
     let worker_count = rayon::current_num_threads().max(1);
     let batch_size = (worker_count * 4).max(1);
 
     let mut emitted_chunks = 0_usize;
 
-    let mut window_min_y = chunk_index.min_chunk_y;
-    while window_min_y <= chunk_index.max_chunk_y {
-        let window_max_y = (window_min_y + window_rows as i32 - 1).min(chunk_index.max_chunk_y);
+    let mut window_min_y = min_chunk_y;
+    while window_min_y <= max_chunk_y {
+        let window_max_y = (window_min_y + window_rows as i32 - 1).min(max_chunk_y);
 
         while next_polygon_cursor < polygons_by_min_y.len() {
             let polygon_idx = polygons_by_min_y[next_polygon_cursor];
@@ -242,6 +417,17 @@ where
                 .max_chunk_y
                 >= window_min_y
         });
+
+        while next_road_cursor < roads_by_min_y.len() {
+            let road_idx = roads_by_min_y[next_road_cursor];
+            if road_index.road_chunk_bounds(road_idx).min_chunk_y > window_max_y {
+                break;
+            }
+            active_roads.push(road_idx);
+            next_road_cursor += 1;
+        }
+
+        active_roads.retain(|road_idx| road_index.road_chunk_bounds(*road_idx).max_chunk_y >= window_min_y);
 
         let mut local_chunk_polygons: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for polygon_idx in active_polygons.iter().copied() {
@@ -263,7 +449,33 @@ where
             }
         }
 
-        let mut chunk_keys = local_chunk_polygons.keys().copied().collect::<Vec<_>>();
+        let mut local_chunk_roads: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for road_idx in active_roads.iter().copied() {
+            let road_chunk_bounds = road_index.road_chunk_bounds(road_idx);
+            if !road_chunk_bounds.intersects_row_window(window_min_y, window_max_y) {
+                continue;
+            }
+
+            let min_y = road_chunk_bounds.min_chunk_y.max(window_min_y);
+            let max_y = road_chunk_bounds.max_chunk_y.min(window_max_y);
+
+            for chunk_y in min_y..=max_y {
+                for chunk_x in road_chunk_bounds.min_chunk_x..=road_chunk_bounds.max_chunk_x {
+                    local_chunk_roads
+                        .entry((chunk_x, chunk_y))
+                        .or_default()
+                        .push(road_idx);
+                }
+            }
+        }
+
+        let mut chunk_keys = local_chunk_polygons
+            .keys()
+            .chain(local_chunk_roads.keys())
+            .copied()
+            .collect::<Vec<_>>();
+        chunk_keys.sort_unstable();
+        chunk_keys.dedup();
         chunk_keys.sort_by_key(|(chunk_x, chunk_y)| (*chunk_y, *chunk_x));
 
         for chunk_batch in chunk_keys.chunks(batch_size) {
@@ -280,6 +492,19 @@ where
                             paint_polygon_into_chunk(
                                 polygon,
                                 bounds,
+                                chunk_x,
+                                chunk_y,
+                                cells_per_side,
+                                &mut cells_buffer,
+                            );
+                        }
+                    }
+
+                    if let Some(road_indices) = local_chunk_roads.get(&(chunk_x, chunk_y)) {
+                        for road_idx in road_indices {
+                            let road = &roads[*road_idx];
+                            paint_road_into_chunk(
+                                road,
                                 chunk_x,
                                 chunk_y,
                                 cells_per_side,

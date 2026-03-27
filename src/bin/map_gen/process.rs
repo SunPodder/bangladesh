@@ -1,7 +1,10 @@
 use crate::constants::{CHUNK_SIZE_METERS, GIS_TO_WORLD_SCALE};
-use crate::geometry::compute_global_bounds;
+use crate::geometry::compute_global_bounds_for_features;
 use crate::pyramid::{PyramidStreamReducer, compute_pyramid_layout};
-use crate::rasterize::{build_chunk_polygon_index, stream_rasterized_chunks};
+use crate::rasterize::{
+    build_chunk_polygon_index, build_chunk_road_index, stream_rasterized_chunks,
+};
+use crate::road_extract::{build_road_polylines, collect_road_ways};
 use crate::terrain_extract::{build_polygons, collect_needed_nodes, collect_terrain_ways};
 use anyhow::{Context, Result, anyhow, ensure};
 use bangladesh::shared::world::{WorldMetadata, WorldWriter, world_output_path};
@@ -31,17 +34,21 @@ pub fn process_terrain_world(
     let raster_memory_budget_bytes =
         (raster_memory_gib * 1024.0 * 1024.0 * 1024.0).round() as u64;
 
-    println!("Scanning terrain ways from {:?}", raw_file_path);
-    let (ways, needed_nodes) = collect_terrain_ways(raw_file_path)?;
+    println!("Scanning terrain and road ways from {:?}", raw_file_path);
+    let (ways, mut needed_nodes) = collect_terrain_ways(raw_file_path)?;
+    let (road_ways, road_needed_nodes) = collect_road_ways(raw_file_path)?;
+    needed_nodes.extend(road_needed_nodes);
+
     ensure!(
-        !ways.is_empty(),
-        "no terrain-compatible closed ways found in {:?}",
+        !ways.is_empty() || !road_ways.is_empty(),
+        "no terrain or road features found in {:?}",
         raw_file_path
     );
 
     println!(
-        "Collected {} terrain ways and {} required nodes",
+        "Collected {} terrain ways, {} road ways, and {} required nodes",
         ways.len(),
+        road_ways.len(),
         needed_nodes.len()
     );
 
@@ -49,18 +56,21 @@ pub fn process_terrain_world(
     println!("Resolved {} referenced nodes", node_lookup.len());
 
     let (mut polygons, skipped_polygons) = build_polygons(ways, &node_lookup);
+    let (mut roads, skipped_roads) = build_road_polylines(road_ways, &node_lookup);
     ensure!(
-        !polygons.is_empty(),
-        "no valid polygons after node resolution"
+        !polygons.is_empty() || !roads.is_empty(),
+        "no valid terrain polygons or road polylines after node resolution"
     );
 
     println!(
-        "Built {} terrain polygons (skipped {})",
+        "Built {} terrain polygons (skipped {}) and {} road polylines (skipped {})",
         polygons.len(),
-        skipped_polygons
+        skipped_polygons,
+        roads.len(),
+        skipped_roads,
     );
 
-    let global_bounds = compute_global_bounds(&polygons)
+    let global_bounds = compute_global_bounds_for_features(&polygons, &roads)
         .ok_or_else(|| anyhow!("failed to compute polygon bounds"))?;
 
     let mercator_origin_x = (global_bounds.min_x / CHUNK_SIZE_METERS).floor() * CHUNK_SIZE_METERS;
@@ -73,23 +83,62 @@ pub fn process_terrain_world(
         }
     }
 
-    let local_bounds = compute_global_bounds(&polygons)
+    for road in &mut roads {
+        for point in &mut road.points {
+            point[0] = (point[0] - mercator_origin_x) * GIS_TO_WORLD_SCALE;
+            point[1] = (point[1] - mercator_origin_y) * GIS_TO_WORLD_SCALE;
+        }
+        road.width_m *= GIS_TO_WORLD_SCALE;
+    }
+
+    let local_bounds = compute_global_bounds_for_features(&polygons, &roads)
         .ok_or_else(|| anyhow!("failed to compute localized polygon bounds"))?;
 
     println!(
-        "Indexing polygon coverage into chunk buckets ({} cells/chunk side)...",
+        "Indexing terrain and roads into chunk buckets ({} cells/chunk side)...",
         cells_per_side
     );
     let chunk_index = build_chunk_polygon_index(&polygons);
+    let road_index = build_chunk_road_index(&roads);
     ensure!(
-        !chunk_index.is_empty(),
-        "terrain rasterization produced no chunk buckets"
+        !chunk_index.is_empty() || !road_index.is_empty(),
+        "terrain and road rasterization produced no chunk buckets"
     );
+
+    let min_chunk_x = if chunk_index.is_empty() {
+        road_index.min_chunk_x
+    } else if road_index.is_empty() {
+        chunk_index.min_chunk_x
+    } else {
+        chunk_index.min_chunk_x.min(road_index.min_chunk_x)
+    };
+    let min_chunk_y = if chunk_index.is_empty() {
+        road_index.min_chunk_y
+    } else if road_index.is_empty() {
+        chunk_index.min_chunk_y
+    } else {
+        chunk_index.min_chunk_y.min(road_index.min_chunk_y)
+    };
+    let max_chunk_x = if chunk_index.is_empty() {
+        road_index.max_chunk_x
+    } else if road_index.is_empty() {
+        chunk_index.max_chunk_x
+    } else {
+        chunk_index.max_chunk_x.max(road_index.max_chunk_x)
+    };
+    let max_chunk_y = if chunk_index.is_empty() {
+        road_index.max_chunk_y
+    } else if road_index.is_empty() {
+        chunk_index.max_chunk_y
+    } else {
+        chunk_index.max_chunk_y.max(road_index.max_chunk_y)
+    };
+
     let pyramid_layout = compute_pyramid_layout(
-        chunk_index.min_chunk_x,
-        chunk_index.min_chunk_y,
-        chunk_index.max_chunk_x,
-        chunk_index.max_chunk_y,
+        min_chunk_x,
+        min_chunk_y,
+        max_chunk_x,
+        max_chunk_y,
     )?;
 
     println!(
@@ -108,6 +157,8 @@ pub fn process_terrain_world(
     let base_tile_count = stream_rasterized_chunks(
         &polygons,
         &chunk_index,
+        &roads,
+        &road_index,
         cells_per_side,
         raster_memory_budget_bytes,
         |chunk_x, chunk_y, cells| {

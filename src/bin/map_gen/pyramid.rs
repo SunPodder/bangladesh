@@ -275,6 +275,7 @@ fn lod_tie_break_priority(code: u8) -> u8 {
         TerrainKind::Unknown => 0,
         // Keep water low in generic LOD ties so rivers do not expand into oceans.
         TerrainKind::Water => 1,
+        TerrainKind::Road => 1,
         TerrainKind::Grass => 2,
         TerrainKind::Farmland => 3,
         TerrainKind::Forest => 4,
@@ -293,14 +294,14 @@ fn is_edge_connected_pair(mask: u8) -> bool {
 }
 
 fn resolve_downsampled_cell(samples: [u8; 4]) -> u8 {
-    let mut counts = [0_u8; 7];
+    let mut counts = [0_u8; 8];
     let mut water_mask = 0_u8;
     for (idx, code) in samples.into_iter().enumerate() {
         if code == TerrainKind::Water.code() {
             water_mask |= 1 << idx;
         }
 
-        let bucket = usize::from(code.min(6));
+        let bucket = usize::from(code.min(7));
         counts[bucket] += 1;
     }
 

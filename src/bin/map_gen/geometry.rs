@@ -1,5 +1,5 @@
 use crate::constants::WEB_MERCATOR_MAX_LAT;
-use crate::terrain_types::TerrainPolygon;
+use crate::terrain_types::{RoadPolyline, TerrainPolygon};
 use std::f64::consts::PI;
 
 #[derive(Clone, Copy)]
@@ -50,12 +50,29 @@ pub fn polygon_bounds(points: &[[f64; 2]]) -> Bounds {
     bounds
 }
 
-pub fn compute_global_bounds(polygons: &[TerrainPolygon]) -> Option<Bounds> {
-    let first = polygons.first()?;
-    let mut bounds = polygon_bounds(&first.points);
+pub fn polyline_bounds(points: &[[f64; 2]]) -> Bounds {
+    let mut bounds = Bounds::new(points[0]);
+    for point in points.iter().copied().skip(1) {
+        bounds.include(point);
+    }
+    bounds
+}
+
+pub fn compute_global_bounds_for_features(
+    polygons: &[TerrainPolygon],
+    roads: &[RoadPolyline],
+) -> Option<Bounds> {
+    let mut bounds = polygons
+        .first()
+        .map(|polygon| polygon_bounds(&polygon.points))
+        .or_else(|| roads.first().map(|road| polyline_bounds(&road.points)))?;
 
     for polygon in polygons.iter().skip(1) {
         bounds.include_bounds(polygon_bounds(&polygon.points));
+    }
+
+    for road in roads {
+        bounds.include_bounds(polyline_bounds(&road.points));
     }
 
     Some(bounds)
@@ -82,4 +99,27 @@ pub fn point_in_polygon(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
     }
 
     inside
+}
+
+pub fn squared_distance_point_to_segment(point: [f64; 2], start: [f64; 2], end: [f64; 2]) -> f64 {
+    let segment_x = end[0] - start[0];
+    let segment_y = end[1] - start[1];
+    let segment_length_sq = segment_x * segment_x + segment_y * segment_y;
+
+    if segment_length_sq <= f64::EPSILON {
+        let dx = point[0] - start[0];
+        let dy = point[1] - start[1];
+        return dx * dx + dy * dy;
+    }
+
+    let projection = ((point[0] - start[0]) * segment_x + (point[1] - start[1]) * segment_y)
+        / segment_length_sq;
+    let t = projection.clamp(0.0, 1.0);
+
+    let nearest_x = start[0] + t * segment_x;
+    let nearest_y = start[1] + t * segment_y;
+
+    let dx = point[0] - nearest_x;
+    let dy = point[1] - nearest_y;
+    dx * dx + dy * dy
 }
