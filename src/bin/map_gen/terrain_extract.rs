@@ -1,5 +1,6 @@
 use crate::constants::DEFAULT_TERRAIN;
 use crate::geometry::lat_lon_to_web_mercator;
+use crate::terrain_tag_filters::{best_terrain_match, classify_tag_pair, is_area_hint_key};
 use crate::terrain_types::{RawTerrainWay, TerrainPolygon};
 use anyhow::{Context, Result};
 use bangladesh::shared::world::TerrainKind;
@@ -17,60 +18,24 @@ fn classify_terrain_tags<'a, I>(tags: I) -> Option<TerrainKind>
 where
     I: Iterator<Item = (&'a str, &'a str)>,
 {
-    let mut best_match: Option<TerrainKind> = None;
-    let mut has_area_hint = false;
+    let tag_pairs: Vec<(&str, &str)> = tags.collect();
 
-    for (key, value) in tags {
-        if matches!(key, "landuse" | "natural" | "leisure") {
-            has_area_hint = true;
-        }
-
-        let terrain = match (key, value) {
-            ("natural", "water")
-            | ("natural", "wetland")
-            | ("natural", "bay")
-            | ("natural", "coastline")
-            | ("waterway", "riverbank") => Some(TerrainKind::Water),
-
-            ("landuse", "forest") | ("natural", "wood") | ("landuse", "wood") => {
-                Some(TerrainKind::Forest)
-            }
-
-            ("landuse", "residential")
-            | ("landuse", "commercial")
-            | ("landuse", "industrial")
-            | ("landuse", "retail")
-            | ("landuse", "construction") => Some(TerrainKind::Urban),
-
-            ("landuse", "farmland")
-            | ("landuse", "orchard")
-            | ("landuse", "vineyard")
-            | ("landuse", "greenhouse_horticulture")
-            | ("landuse", "plant_nursery")
-            | ("landuse", "plantation") => Some(TerrainKind::Farmland),
-
-            ("natural", "sand") | ("natural", "beach") => Some(TerrainKind::Sand),
-
-            ("landuse", "grass")
-            | ("landuse", "meadow")
-            | ("landuse", "village_green")
-            | ("landuse", "recreation_ground")
-            | ("natural", "grassland") => Some(TerrainKind::Grass),
-
-            _ => None,
-        };
-
-        if let Some(candidate) = terrain {
-            best_match = match best_match {
-                Some(existing) if existing.priority() >= candidate.priority() => Some(existing),
-                _ => Some(candidate),
-            };
-        }
+    if let Some(best_match) = best_terrain_match(tag_pairs.iter().copied()) {
+        return Some(best_match);
     }
 
-    if best_match.is_some() {
-        best_match
-    } else if has_area_hint {
+    let unmatched_area_tags: Vec<String> = tag_pairs
+        .iter()
+        .copied()
+        .filter(|(key, value)| is_area_hint_key(key) && classify_tag_pair(key, value).is_none())
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+
+    if !unmatched_area_tags.is_empty() {
+        eprintln!(
+            "terrain_extract: default terrain fallback for unmatched tags: {}",
+            unmatched_area_tags.join(", ")
+        );
         Some(DEFAULT_TERRAIN)
     } else {
         None

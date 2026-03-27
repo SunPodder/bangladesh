@@ -6,6 +6,7 @@ mod process;
 mod pyramid;
 mod rasterize;
 mod terrain_extract;
+mod terrain_tag_filters;
 mod terrain_types;
 
 use anyhow::Result;
