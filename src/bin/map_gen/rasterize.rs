@@ -1,32 +1,54 @@
 use crate::constants::{CHUNK_SIZE_METERS, DEFAULT_TERRAIN};
 use crate::geometry::{Bounds, point_in_polygon, polygon_bounds};
 use crate::terrain_types::TerrainPolygon;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use bangladesh::shared::world::TerrainKind;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::HashMap;
+
+#[derive(Clone, Copy)]
+pub struct PolygonChunkBounds {
+    pub min_chunk_x: i32,
+    pub min_chunk_y: i32,
+    pub max_chunk_x: i32,
+    pub max_chunk_y: i32,
+}
+
+impl PolygonChunkBounds {
+    fn intersects_row_window(self, window_min_y: i32, window_max_y: i32) -> bool {
+        self.max_chunk_y >= window_min_y && self.min_chunk_y <= window_max_y
+    }
+}
 
 pub struct RasterChunkIndex {
     pub min_chunk_x: i32,
     pub min_chunk_y: i32,
     pub max_chunk_x: i32,
     pub max_chunk_y: i32,
-    pub chunk_polygons: HashMap<(i32, i32), Vec<usize>>,
     polygon_bounds: Vec<Bounds>,
+    polygon_chunk_bounds: Vec<PolygonChunkBounds>,
 }
 
 impl RasterChunkIndex {
-    pub fn chunk_count(&self) -> usize {
-        self.chunk_polygons.len()
+    pub fn chunk_span_width(&self) -> usize {
+        (self.max_chunk_x - self.min_chunk_x + 1).max(0) as usize
+    }
+
+    pub fn chunk_span_height(&self) -> usize {
+        (self.max_chunk_y - self.min_chunk_y + 1).max(0) as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chunk_polygons.is_empty()
+        self.polygon_bounds.is_empty()
     }
 
     pub fn polygon_bounds(&self, polygon_idx: usize) -> Bounds {
         self.polygon_bounds[polygon_idx]
+    }
+
+    pub fn polygon_chunk_bounds(&self, polygon_idx: usize) -> PolygonChunkBounds {
+        self.polygon_chunk_bounds[polygon_idx]
     }
 }
 
@@ -76,8 +98,8 @@ fn paint_polygon_into_chunk(
 }
 
 pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkIndex {
-    let mut chunk_polygons: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
     let mut polygon_bounds_cache = Vec::with_capacity(polygons.len());
+    let mut polygon_chunk_bounds = Vec::with_capacity(polygons.len());
 
     let mut min_chunk_x = i32::MAX;
     let mut min_chunk_y = i32::MAX;
@@ -95,25 +117,20 @@ pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkInde
         let bounds = polygon_bounds(&polygon.points);
         polygon_bounds_cache.push(bounds);
 
-        let polygon_min_chunk_x = (bounds.min_x / CHUNK_SIZE_METERS).floor() as i32;
-        let polygon_max_chunk_x = (bounds.max_x / CHUNK_SIZE_METERS).floor() as i32;
-        let polygon_min_chunk_y = (bounds.min_y / CHUNK_SIZE_METERS).floor() as i32;
-        let polygon_max_chunk_y = (bounds.max_y / CHUNK_SIZE_METERS).floor() as i32;
+        let chunk_bounds = PolygonChunkBounds {
+            min_chunk_x: (bounds.min_x / CHUNK_SIZE_METERS).floor() as i32,
+            max_chunk_x: (bounds.max_x / CHUNK_SIZE_METERS).floor() as i32,
+            min_chunk_y: (bounds.min_y / CHUNK_SIZE_METERS).floor() as i32,
+            max_chunk_y: (bounds.max_y / CHUNK_SIZE_METERS).floor() as i32,
+        };
+        polygon_chunk_bounds.push(chunk_bounds);
 
-        min_chunk_x = min_chunk_x.min(polygon_min_chunk_x);
-        min_chunk_y = min_chunk_y.min(polygon_min_chunk_y);
-        max_chunk_x = max_chunk_x.max(polygon_max_chunk_x);
-        max_chunk_y = max_chunk_y.max(polygon_max_chunk_y);
+        min_chunk_x = min_chunk_x.min(chunk_bounds.min_chunk_x);
+        min_chunk_y = min_chunk_y.min(chunk_bounds.min_chunk_y);
+        max_chunk_x = max_chunk_x.max(chunk_bounds.max_chunk_x);
+        max_chunk_y = max_chunk_y.max(chunk_bounds.max_chunk_y);
 
-        for chunk_y in polygon_min_chunk_y..=polygon_max_chunk_y {
-            for chunk_x in polygon_min_chunk_x..=polygon_max_chunk_x {
-                chunk_polygons
-                    .entry((chunk_x, chunk_y))
-                    .or_default()
-                    .push(polygon_idx);
-            }
-        }
-
+        let _ = polygon_idx;
         progress.inc(1);
     }
 
@@ -125,8 +142,8 @@ pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkInde
             min_chunk_y: 0,
             max_chunk_x: -1,
             max_chunk_y: -1,
-            chunk_polygons,
             polygon_bounds: polygon_bounds_cache,
+            polygon_chunk_bounds,
         };
     }
 
@@ -135,75 +152,158 @@ pub fn build_chunk_polygon_index(polygons: &[TerrainPolygon]) -> RasterChunkInde
         min_chunk_y,
         max_chunk_x,
         max_chunk_y,
-        chunk_polygons,
         polygon_bounds: polygon_bounds_cache,
+        polygon_chunk_bounds,
     }
+}
+
+fn estimate_window_rows(
+    cells_per_side: usize,
+    span_width: usize,
+    raster_memory_budget_bytes: u64,
+) -> usize {
+    let cells_per_chunk = cells_per_side.saturating_mul(cells_per_side).max(1);
+    let bytes_per_chunk = cells_per_chunk as u64;
+    let target_chunk_budget = raster_memory_budget_bytes
+        .saturating_div(bytes_per_chunk.saturating_mul(6).max(1))
+        .max(1024);
+    let width = span_width.max(1) as u64;
+    let estimated_rows = target_chunk_budget / width;
+
+    estimated_rows.clamp(8, 256) as usize
 }
 
 pub fn stream_rasterized_chunks<F>(
     polygons: &[TerrainPolygon],
     chunk_index: &RasterChunkIndex,
     cells_per_side: usize,
+    raster_memory_budget_bytes: u64,
     emit_chunk: F,
 ) -> Result<usize>
 where
-    F: FnMut(i32, i32, &[u8]) -> Result<()>,
+    F: FnMut(i32, i32, Vec<u8>) -> Result<()>,
 {
-    let mut emit_chunk = emit_chunk;
-    let mut chunk_keys = chunk_index
-        .chunk_polygons
-        .keys()
-        .copied()
-        .collect::<Vec<_>>();
-    chunk_keys.sort_by_key(|(chunk_x, chunk_y)| (*chunk_y, *chunk_x));
+    ensure!(
+        raster_memory_budget_bytes > 0,
+        "raster memory budget must be greater than zero"
+    );
 
-    let progress = ProgressBar::new(chunk_keys.len() as u64);
+    let mut emit_chunk = emit_chunk;
+
+    if chunk_index.is_empty() {
+        return Ok(0);
+    }
+
+    let span_width = chunk_index.chunk_span_width();
+    let span_height = chunk_index.chunk_span_height();
+    let window_rows = estimate_window_rows(cells_per_side, span_width, raster_memory_budget_bytes);
+    let total_windows = span_height.div_ceil(window_rows);
+
+    let progress = ProgressBar::new(total_windows as u64);
     if let Ok(style) = ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} chunks",
+        "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} windows ({msg})",
     ) {
         progress.set_style(style.progress_chars("##-"));
     }
+    progress.set_message("0 chunks");
 
     let default_code = DEFAULT_TERRAIN.code();
     let cells_per_chunk = cells_per_side * cells_per_side;
 
-    // Process bounded batches in parallel to keep memory stable while retaining deterministic
-    // single-thread tile emission into the world/spool writers.
+    let mut polygons_by_min_y = (0..polygons.len()).collect::<Vec<_>>();
+    polygons_by_min_y.sort_unstable_by_key(|polygon_idx| {
+        chunk_index.polygon_chunk_bounds(*polygon_idx).min_chunk_y
+    });
+
+    let mut next_polygon_cursor = 0_usize;
+    let mut active_polygons = Vec::new();
+
     let worker_count = rayon::current_num_threads().max(1);
     let batch_size = (worker_count * 4).max(1);
 
-    for chunk_batch in chunk_keys.chunks(batch_size) {
-        let rasterized_batch = chunk_batch
-            .par_iter()
-            .copied()
-            .map(|(chunk_x, chunk_y)| {
-                let mut cells_buffer = vec![default_code; cells_per_chunk];
+    let mut emitted_chunks = 0_usize;
 
-                if let Some(polygon_indices) = chunk_index.chunk_polygons.get(&(chunk_x, chunk_y)) {
-                    for polygon_idx in polygon_indices {
-                        let polygon = &polygons[*polygon_idx];
-                        let bounds = chunk_index.polygon_bounds(*polygon_idx);
-                        paint_polygon_into_chunk(
-                            polygon,
-                            bounds,
-                            chunk_x,
-                            chunk_y,
-                            cells_per_side,
-                            &mut cells_buffer,
-                        );
-                    }
-                }
+    let mut window_min_y = chunk_index.min_chunk_y;
+    while window_min_y <= chunk_index.max_chunk_y {
+        let window_max_y = (window_min_y + window_rows as i32 - 1).min(chunk_index.max_chunk_y);
 
-                (chunk_x, chunk_y, cells_buffer)
-            })
-            .collect::<Vec<_>>();
-
-        for (chunk_x, chunk_y, cells) in rasterized_batch {
-            emit_chunk(chunk_x, chunk_y, &cells)?;
-            progress.inc(1);
+        while next_polygon_cursor < polygons_by_min_y.len() {
+            let polygon_idx = polygons_by_min_y[next_polygon_cursor];
+            if chunk_index.polygon_chunk_bounds(polygon_idx).min_chunk_y > window_max_y {
+                break;
+            }
+            active_polygons.push(polygon_idx);
+            next_polygon_cursor += 1;
         }
+
+        active_polygons.retain(|polygon_idx| {
+            chunk_index
+                .polygon_chunk_bounds(*polygon_idx)
+                .max_chunk_y
+                >= window_min_y
+        });
+
+        let mut local_chunk_polygons: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for polygon_idx in active_polygons.iter().copied() {
+            let polygon_chunk_bounds = chunk_index.polygon_chunk_bounds(polygon_idx);
+            if !polygon_chunk_bounds.intersects_row_window(window_min_y, window_max_y) {
+                continue;
+            }
+
+            let min_y = polygon_chunk_bounds.min_chunk_y.max(window_min_y);
+            let max_y = polygon_chunk_bounds.max_chunk_y.min(window_max_y);
+
+            for chunk_y in min_y..=max_y {
+                for chunk_x in polygon_chunk_bounds.min_chunk_x..=polygon_chunk_bounds.max_chunk_x {
+                    local_chunk_polygons
+                        .entry((chunk_x, chunk_y))
+                        .or_default()
+                        .push(polygon_idx);
+                }
+            }
+        }
+
+        let mut chunk_keys = local_chunk_polygons.keys().copied().collect::<Vec<_>>();
+        chunk_keys.sort_by_key(|(chunk_x, chunk_y)| (*chunk_y, *chunk_x));
+
+        for chunk_batch in chunk_keys.chunks(batch_size) {
+            let rasterized_batch = chunk_batch
+                .par_iter()
+                .copied()
+                .map(|(chunk_x, chunk_y)| {
+                    let mut cells_buffer = vec![default_code; cells_per_chunk];
+
+                    if let Some(polygon_indices) = local_chunk_polygons.get(&(chunk_x, chunk_y)) {
+                        for polygon_idx in polygon_indices {
+                            let polygon = &polygons[*polygon_idx];
+                            let bounds = chunk_index.polygon_bounds(*polygon_idx);
+                            paint_polygon_into_chunk(
+                                polygon,
+                                bounds,
+                                chunk_x,
+                                chunk_y,
+                                cells_per_side,
+                                &mut cells_buffer,
+                            );
+                        }
+                    }
+
+                    (chunk_x, chunk_y, cells_buffer)
+                })
+                .collect::<Vec<_>>();
+
+            for (chunk_x, chunk_y, cells) in rasterized_batch {
+                emit_chunk(chunk_x, chunk_y, cells)?;
+                emitted_chunks += 1;
+            }
+        }
+
+        progress.inc(1);
+        progress.set_message(format!("{} chunks", emitted_chunks));
+
+        window_min_y = window_max_y + 1;
     }
 
     progress.finish_with_message("Chunk rasterization stream complete");
-    Ok(chunk_index.chunk_count())
+    Ok(emitted_chunks)
 }

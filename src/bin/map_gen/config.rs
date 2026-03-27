@@ -17,6 +17,10 @@ pub struct Args {
     /// Terrain raster resolution per chunk side. Higher values improve detail but increase bake time and world size.
     #[arg(long, default_value_t = DEFAULT_CELLS_PER_SIDE)]
     pub cells_per_side: usize,
+
+    /// Approximate rasterization memory budget in GiB for windowed processing.
+    #[arg(long, default_value_t = 8.0)]
+    pub raster_memory_gib: f64,
 }
 
 pub struct RegionConfig {

@@ -10,11 +10,11 @@
 - **Processing (Terrain-first)**: `map_gen` parses terrain tags from both closed OSM ways and `type=multipolygon` relations (outer way members stitched into rings), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
 - **Detail Resolution**: `map_gen` raster detail is configurable via `--cells-per-side` (even integer, default `256`), controlling max playable detail as $\text{cell size} = \frac{1024m}{\text{cells per side}}$.
 - **Pyramid Bake**: `map_gen` derives a sparse hierarchical tile pyramid from real raster chunks only (`zoom = playable..0`) by 2x downsampling each parent from 4 children. No synthetic detail subdivision is generated.
-- **Chunk Raster Streaming**: Rasterization now builds a polygon->chunk index and then rasterizes one chunk at a time with a reusable fixed cell buffer; full base chunk-cell maps are no longer kept in memory.
+- **Chunk Raster Windowing**: Rasterization now precomputes per-polygon chunk bounds, then processes bounded chunk-row windows in memory and emits finalized base tiles immediately; no global chunk->polygon map is retained.
 - **Parallel Chunk Rasterization**: Chunk cell computation now runs in Rayon workers with per-chunk local buffers in bounded batches; tile emission remains single-threaded and ordered to keep world writes deterministic and race-free.
-- **Disk-Backed Pyramid Streaming**: Base tiles are spooled to a temporary level file, and parent levels are generated row-pair-at-a-time from that spool into the final world writer. Peak memory is bounded to row working sets instead of whole zoom levels.
-- **Streaming World Write**: `map_gen` streams tiles into a temporary world tile-data spool and finalizes `.world` metadata afterward, avoiding in-memory accumulation of serialized tile bytes.
-- **Memory Strategy**: Final world assembly uses a fixed reusable copy buffer when committing tile data to the output file, trading throughput for predictable memory bounds.
+- **In-Memory Pyramid Streaming**: Parent LOD levels are now reduced from streamed base rows in-memory (row-pair reducers per level), and each finalized parent tile is emitted directly to the world writer.
+- **Direct World Streaming Write**: `.world` generation now writes tile payloads directly to the final output file and appends metadata as a trailer pointer (world format v3), removing temporary tile spool files.
+- **Memory Strategy**: Raster memory is controlled by `--raster-memory-gib` (default `8`) and window sizing, keeping peak usage near the requested budget while preserving deterministic output ordering.
 - **Storage**: Map assets are unified in `assets/map/`: source `.pbf` and processed `.world` files are separated by extension in the same directory.
 - **Format**: `.world` stores compact metadata + tile index keyed by `(zoom, tile_x, tile_y)` + per-tile `rkyv` archived payloads.
 - **Runtime Loading**: Metadata is loaded first; terrain tiles are loaded on-demand by camera zoom + visible bounds. Full world file must never be loaded all at once.

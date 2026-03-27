@@ -1,16 +1,7 @@
 use crate::constants::{CHUNK_SIZE_METERS, DEFAULT_TERRAIN};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Result, anyhow, ensure};
 use bangladesh::shared::world::TerrainKind;
-use indicatif::{ProgressBar, ProgressStyle};
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-const LEVEL_RECORD_COORD_BYTES: usize = 8;
-static LEVEL_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy)]
 pub struct PyramidLayout {
@@ -21,18 +12,19 @@ pub struct PyramidLayout {
 }
 
 #[derive(Debug)]
-pub struct LevelSpoolWriter {
-    path: PathBuf,
-    file: File,
-    cells_len: usize,
-    record_count: usize,
+struct ParentLevelReducer {
+    parent_zoom: u8,
+    cells_per_side: usize,
+    current_child_row_y: Option<i32>,
+    current_row_tiles: HashMap<i32, Vec<u8>>,
+    active_parent_y: Option<i32>,
+    even_row_tiles: HashMap<i32, Vec<u8>>,
+    odd_row_tiles: HashMap<i32, Vec<u8>>,
 }
 
 #[derive(Debug)]
-struct LevelTileRecord {
-    tile_x: i32,
-    tile_y: i32,
-    cells: Vec<u8>,
+pub struct PyramidStreamReducer {
+    levels: Vec<ParentLevelReducer>,
 }
 
 fn ceil_log2(value: u32) -> u8 {
@@ -73,355 +65,215 @@ pub fn compute_pyramid_layout(
     })
 }
 
-impl LevelSpoolWriter {
-    pub fn create(output_dir: &Path, region: &str, label: &str, zoom: u8, cells_per_side: usize) -> Result<Self> {
-        let cells_len = cells_per_side
-            .checked_mul(cells_per_side)
-            .ok_or_else(|| anyhow!("cells per side overflows usize"))?;
-        let path = build_temp_level_path(output_dir, region, label, zoom);
-        let file = OpenOptions::new()
-            .read(false)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .with_context(|| format!("failed to create temporary level spool at {}", path.display()))?;
-
-        Ok(Self {
-            path,
-            file,
-            cells_len,
-            record_count: 0,
-        })
-    }
-
-    pub fn append_tile(&mut self, tile_x: i32, tile_y: i32, cells: &[u8]) -> Result<()> {
-        ensure!(
-            cells.len() == self.cells_len,
-            "tile cell payload size mismatch while writing level spool"
-        );
-
-        self.file
-            .write_all(&tile_x.to_le_bytes())
-            .context("failed to write level spool tile_x")?;
-        self.file
-            .write_all(&tile_y.to_le_bytes())
-            .context("failed to write level spool tile_y")?;
-        self.file
-            .write_all(cells)
-            .context("failed to write level spool cells")?;
-
-        self.record_count += 1;
-        Ok(())
-    }
-
-    pub fn finish(mut self) -> Result<PathBuf> {
-        self.file
-            .flush()
-            .context("failed to flush temporary level spool")?;
-        Ok(self.path)
-    }
-}
-
-pub fn build_parent_levels_from_spool<F>(
-    base_level_path: &Path,
-    output_dir: &Path,
-    region: &str,
-    cells_per_side: usize,
-    playable_zoom_level: u8,
-    mut emit_tile: F,
-) -> Result<usize>
-where
-    F: FnMut(u8, i32, i32, Vec<u8>) -> Result<()>,
-{
-    if playable_zoom_level == 0 {
-        return Ok(0);
-    }
-
-    let mut child_level_path = base_level_path.to_path_buf();
-    let mut parent_tile_count = 0_usize;
-
-    for parent_zoom in (0..playable_zoom_level).rev() {
-        let (generated, parent_level_path) = reduce_child_level_to_parent(
-            &child_level_path,
-            output_dir,
-            region,
+impl ParentLevelReducer {
+    fn new(parent_zoom: u8, cells_per_side: usize) -> Self {
+        Self {
             parent_zoom,
             cells_per_side,
-            &mut emit_tile,
-        )?;
-        parent_tile_count += generated;
-
-        let _ = std::fs::remove_file(&child_level_path);
-        child_level_path = parent_level_path;
+            current_child_row_y: None,
+            current_row_tiles: HashMap::new(),
+            active_parent_y: None,
+            even_row_tiles: HashMap::new(),
+            odd_row_tiles: HashMap::new(),
+        }
     }
 
-    let _ = std::fs::remove_file(&child_level_path);
-    Ok(parent_tile_count)
-}
+    fn ingest_child_tile(
+        &mut self,
+        child_tile_x: i32,
+        child_tile_y: i32,
+        child_cells: Vec<u8>,
+    ) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        let mut produced_tiles = Vec::new();
 
-fn reduce_child_level_to_parent<F>(
-    child_level_path: &Path,
-    output_dir: &Path,
-    region: &str,
-    parent_zoom: u8,
-    cells_per_side: usize,
-    emit_tile: &mut F,
-) -> Result<(usize, PathBuf)>
-where
-    F: FnMut(u8, i32, i32, Vec<u8>) -> Result<()>,
-{
-    let cells_len = cells_per_side
-        .checked_mul(cells_per_side)
-        .ok_or_else(|| anyhow!("cells per side overflows usize"))?;
-    let record_size = (LEVEL_RECORD_COORD_BYTES + cells_len) as u64;
+        if let Some(current_row_y) = self.current_child_row_y {
+            ensure!(
+                child_tile_y >= current_row_y,
+                "child tiles must be streamed in non-decreasing y order"
+            );
 
-    let input_len = std::fs::metadata(child_level_path)
-        .with_context(|| {
-            format!(
-                "failed to stat temporary child level spool {}",
-                child_level_path.display()
-            )
-        })?
-        .len();
-
-    ensure!(
-        input_len % record_size == 0,
-        "temporary child level spool is corrupted: invalid record alignment"
-    );
-
-    let input_record_count = input_len / record_size;
-    let mut child_file = File::open(child_level_path).with_context(|| {
-        format!(
-            "failed to open temporary child level spool {}",
-            child_level_path.display()
-        )
-    })?;
-
-    let mut parent_writer =
-        LevelSpoolWriter::create(output_dir, region, "pyramid", parent_zoom, cells_per_side)?;
-
-    let progress = ProgressBar::new(input_record_count);
-    if let Ok(style) = ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:40.green/blue} {pos}/{len} z{msg} records",
-    ) {
-        progress.set_style(style.progress_chars("##-"));
-    }
-    progress.set_message(parent_zoom.to_string());
-
-    let mut generated = 0_usize;
-
-    let mut current_row_y: Option<i32> = None;
-    let mut current_row_tiles: HashMap<i32, Vec<u8>> = HashMap::new();
-
-    let mut active_parent_y: Option<i32> = None;
-    let mut even_row_tiles: HashMap<i32, Vec<u8>> = HashMap::new();
-    let mut odd_row_tiles: HashMap<i32, Vec<u8>> = HashMap::new();
-
-    while let Some(record) = read_level_record(&mut child_file, cells_len)? {
-        progress.inc(1);
-
-        match current_row_y {
-            Some(row_y) if row_y != record.tile_y => {
-                generated += process_child_row(
-                    row_y,
-                    std::mem::take(&mut current_row_tiles),
-                    &mut active_parent_y,
-                    &mut even_row_tiles,
-                    &mut odd_row_tiles,
-                    cells_per_side,
-                    parent_zoom,
-                    &mut parent_writer,
-                    emit_tile,
-                )?;
-                current_row_y = Some(record.tile_y);
+            if child_tile_y != current_row_y {
+                produced_tiles.extend(self.flush_child_row()?);
             }
-            None => {
-                current_row_y = Some(record.tile_y);
-            }
-            _ => {}
         }
 
-        current_row_tiles.insert(record.tile_x, record.cells);
+        self.current_child_row_y = Some(child_tile_y);
+        self.current_row_tiles.insert(child_tile_x, child_cells);
+
+        Ok(produced_tiles)
     }
 
-    if let Some(row_y) = current_row_y {
-        generated += process_child_row(
-            row_y,
-            std::mem::take(&mut current_row_tiles),
-            &mut active_parent_y,
-            &mut even_row_tiles,
-            &mut odd_row_tiles,
-            cells_per_side,
-            parent_zoom,
-            &mut parent_writer,
-            emit_tile,
-        )?;
+    fn finish(&mut self) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        let mut produced_tiles = self.flush_child_row()?;
+
+        if let Some(parent_y) = self.active_parent_y.take() {
+            produced_tiles.extend(self.emit_parent_row(parent_y));
+        }
+
+        self.even_row_tiles.clear();
+        self.odd_row_tiles.clear();
+
+        Ok(produced_tiles)
     }
 
-    if let Some(parent_y) = active_parent_y {
-        generated += emit_parent_row(
-            parent_y,
-            &even_row_tiles,
-            &odd_row_tiles,
-            cells_per_side,
-            parent_zoom,
-            &mut parent_writer,
-            emit_tile,
-        )?;
+    fn flush_child_row(&mut self) -> Result<Vec<(i32, i32, Vec<u8>)>> {
+        let Some(row_y) = self.current_child_row_y.take() else {
+            return Ok(Vec::new());
+        };
+
+        let row_tiles = std::mem::take(&mut self.current_row_tiles);
+        let row_parent_y = row_y.div_euclid(2);
+
+        let mut produced_tiles = Vec::new();
+
+        if self.active_parent_y.is_some() && self.active_parent_y != Some(row_parent_y) {
+            let previous_parent_y = self
+                .active_parent_y
+                .take()
+                .ok_or_else(|| anyhow!("missing active parent row state"))?;
+            produced_tiles.extend(self.emit_parent_row(previous_parent_y));
+            self.even_row_tiles.clear();
+            self.odd_row_tiles.clear();
+        }
+
+        self.active_parent_y = Some(row_parent_y);
+        if row_y.rem_euclid(2) == 0 {
+            self.even_row_tiles = row_tiles;
+        } else {
+            self.odd_row_tiles = row_tiles;
+        }
+
+        Ok(produced_tiles)
     }
 
-    progress.finish_with_message(format!("z{parent_zoom} reduction complete"));
-    let parent_level_path = parent_writer.finish()?;
+    fn emit_parent_row(&self, parent_y: i32) -> Vec<(i32, i32, Vec<u8>)> {
+        if self.even_row_tiles.is_empty() && self.odd_row_tiles.is_empty() {
+            return Vec::new();
+        }
 
-    Ok((generated, parent_level_path))
+        let mut parent_xs = HashSet::new();
+        for child_x in self.even_row_tiles.keys() {
+            parent_xs.insert(child_x.div_euclid(2));
+        }
+        for child_x in self.odd_row_tiles.keys() {
+            parent_xs.insert(child_x.div_euclid(2));
+        }
+
+        let mut sorted_parent_xs = parent_xs.into_iter().collect::<Vec<_>>();
+        sorted_parent_xs.sort_unstable();
+
+        let mut produced_tiles = Vec::with_capacity(sorted_parent_xs.len());
+        for parent_x in sorted_parent_xs {
+            let children = [
+                self.even_row_tiles.get(&(parent_x * 2)).map(Vec::as_slice),
+                self.even_row_tiles
+                    .get(&(parent_x * 2 + 1))
+                    .map(Vec::as_slice),
+                self.odd_row_tiles.get(&(parent_x * 2)).map(Vec::as_slice),
+                self.odd_row_tiles
+                    .get(&(parent_x * 2 + 1))
+                    .map(Vec::as_slice),
+            ];
+
+            let parent_cells = downsample_parent_tile(children, self.cells_per_side);
+            produced_tiles.push((parent_x, parent_y, parent_cells));
+        }
+
+        produced_tiles
+    }
 }
 
-fn process_child_row<F>(
-    row_y: i32,
-    row_tiles: HashMap<i32, Vec<u8>>,
-    active_parent_y: &mut Option<i32>,
-    even_row_tiles: &mut HashMap<i32, Vec<u8>>,
-    odd_row_tiles: &mut HashMap<i32, Vec<u8>>,
-    cells_per_side: usize,
-    parent_zoom: u8,
-    parent_writer: &mut LevelSpoolWriter,
-    emit_tile: &mut F,
-) -> Result<usize>
-where
-    F: FnMut(u8, i32, i32, Vec<u8>) -> Result<()>,
-{
-    let mut generated = 0_usize;
-    let row_parent_y = row_y.div_euclid(2);
+impl PyramidStreamReducer {
+    pub fn new(playable_zoom_level: u8, cells_per_side: usize) -> Result<Self> {
+        ensure!(
+            cells_per_side % 2 == 0,
+            "cells_per_side must be even for 2x downsampling"
+        );
 
-    if active_parent_y.is_some() && *active_parent_y != Some(row_parent_y) {
-        let previous_parent_y = active_parent_y
-            .take()
-            .ok_or_else(|| anyhow!("missing active parent row state"))?;
-        generated += emit_parent_row(
-            previous_parent_y,
-            even_row_tiles,
-            odd_row_tiles,
-            cells_per_side,
-            parent_zoom,
-            parent_writer,
-            emit_tile,
-        )?;
-        even_row_tiles.clear();
-        odd_row_tiles.clear();
+        let mut levels = Vec::with_capacity(playable_zoom_level as usize);
+        for parent_zoom in (0..playable_zoom_level).rev() {
+            levels.push(ParentLevelReducer::new(parent_zoom, cells_per_side));
+        }
+
+        Ok(Self { levels })
     }
 
-    *active_parent_y = Some(row_parent_y);
-
-    if row_y.rem_euclid(2) == 0 {
-        *even_row_tiles = row_tiles;
-    } else {
-        *odd_row_tiles = row_tiles;
+    pub fn push_playable_tile<F>(
+        &mut self,
+        playable_tile_x: i32,
+        playable_tile_y: i32,
+        playable_cells: Vec<u8>,
+        emit_parent: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(u8, i32, i32, &[u8]) -> Result<()>,
+    {
+        self.propagate_from_level(0, playable_tile_x, playable_tile_y, playable_cells, emit_parent)
     }
 
-    Ok(generated)
-}
+    pub fn finish<F>(&mut self, emit_parent: &mut F) -> Result<usize>
+    where
+        F: FnMut(u8, i32, i32, &[u8]) -> Result<()>,
+    {
+        let mut generated = 0_usize;
 
-fn emit_parent_row<F>(
-    parent_y: i32,
-    even_row_tiles: &HashMap<i32, Vec<u8>>,
-    odd_row_tiles: &HashMap<i32, Vec<u8>>,
-    cells_per_side: usize,
-    parent_zoom: u8,
-    parent_writer: &mut LevelSpoolWriter,
-    emit_tile: &mut F,
-) -> Result<usize>
-where
-    F: FnMut(u8, i32, i32, Vec<u8>) -> Result<()>,
-{
-    if even_row_tiles.is_empty() && odd_row_tiles.is_empty() {
-        return Ok(0);
+        for level_idx in 0..self.levels.len() {
+            let parent_zoom = self.levels[level_idx].parent_zoom;
+            let produced = self.levels[level_idx].finish()?;
+
+            generated += produced.len();
+            for (parent_x, parent_y, parent_cells) in produced {
+                emit_parent(parent_zoom, parent_x, parent_y, &parent_cells)?;
+                generated +=
+                    self.propagate_from_level(level_idx + 1, parent_x, parent_y, parent_cells, emit_parent)?;
+            }
+        }
+
+        Ok(generated)
     }
 
-    let mut parent_xs = HashSet::new();
-    for child_x in even_row_tiles.keys() {
-        parent_xs.insert(child_x.div_euclid(2));
+    fn propagate_from_level<F>(
+        &mut self,
+        start_level_idx: usize,
+        child_tile_x: i32,
+        child_tile_y: i32,
+        child_cells: Vec<u8>,
+        emit_parent: &mut F,
+    ) -> Result<usize>
+    where
+        F: FnMut(u8, i32, i32, &[u8]) -> Result<()>,
+    {
+        if start_level_idx >= self.levels.len() {
+            return Ok(0);
+        }
+
+        let mut generated = 0_usize;
+        let mut queue = VecDeque::new();
+        queue.push_back((start_level_idx, child_tile_x, child_tile_y, child_cells));
+
+        while let Some((level_idx, tile_x, tile_y, cells)) = queue.pop_front() {
+            if level_idx >= self.levels.len() {
+                continue;
+            }
+
+            let parent_zoom = self.levels[level_idx].parent_zoom;
+            let produced = self.levels[level_idx].ingest_child_tile(tile_x, tile_y, cells)?;
+
+            generated += produced.len();
+            for (parent_x, parent_y, parent_cells) in produced {
+                emit_parent(parent_zoom, parent_x, parent_y, &parent_cells)?;
+                queue.push_back((level_idx + 1, parent_x, parent_y, parent_cells));
+            }
+        }
+
+        Ok(generated)
     }
-    for child_x in odd_row_tiles.keys() {
-        parent_xs.insert(child_x.div_euclid(2));
-    }
-
-    let mut sorted_parent_xs = parent_xs.into_iter().collect::<Vec<_>>();
-    sorted_parent_xs.sort_unstable();
-
-    let mut generated = 0_usize;
-    for parent_x in sorted_parent_xs {
-        let children = [
-            even_row_tiles.get(&(parent_x * 2)).map(Vec::as_slice),
-            even_row_tiles.get(&(parent_x * 2 + 1)).map(Vec::as_slice),
-            odd_row_tiles.get(&(parent_x * 2)).map(Vec::as_slice),
-            odd_row_tiles.get(&(parent_x * 2 + 1)).map(Vec::as_slice),
-        ];
-
-        let parent_cells = downsample_parent_tile(children, cells_per_side);
-        parent_writer.append_tile(parent_x, parent_y, &parent_cells)?;
-        emit_tile(parent_zoom, parent_x, parent_y, parent_cells)?;
-        generated += 1;
-    }
-
-    Ok(generated)
-}
-
-fn read_level_record(file: &mut File, cells_len: usize) -> Result<Option<LevelTileRecord>> {
-    let mut first = [0_u8; 1];
-    let first_read = file
-        .read(&mut first)
-        .context("failed while reading level spool record")?;
-
-    if first_read == 0 {
-        return Ok(None);
-    }
-
-    let mut header = [0_u8; LEVEL_RECORD_COORD_BYTES];
-    header[0] = first[0];
-    file.read_exact(&mut header[1..])
-        .context("failed to read level spool coordinate header")?;
-
-    let tile_x = i32::from_le_bytes(
-        header[0..4]
-            .try_into()
-            .map_err(|_| anyhow!("invalid level spool tile_x header bytes"))?,
-    );
-    let tile_y = i32::from_le_bytes(
-        header[4..8]
-            .try_into()
-            .map_err(|_| anyhow!("invalid level spool tile_y header bytes"))?,
-    );
-
-    let mut cells = vec![0_u8; cells_len];
-    file.read_exact(&mut cells)
-        .context("failed to read level spool tile cells")?;
-
-    Ok(Some(LevelTileRecord {
-        tile_x,
-        tile_y,
-        cells,
-    }))
-}
-
-fn build_temp_level_path(output_dir: &Path, region: &str, label: &str, zoom: u8) -> PathBuf {
-    let unique_suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
-    let unique_counter = LEVEL_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    output_dir.join(format!(
-        ".{region}.{label}.z{zoom}.{}.{}.{}.level.tmp",
-        std::process::id(),
-        unique_suffix,
-        unique_counter
-    ))
 }
 
 fn lod_tie_break_priority(code: u8) -> u8 {
     match TerrainKind::from_code(code) {
         TerrainKind::Unknown => 0,
-        // Keep water low in LOD ties so rivers don't expand into oceans.
+        // Keep water low in LOD ties so rivers do not expand into oceans.
         TerrainKind::Water => 1,
         TerrainKind::Grass => 2,
         TerrainKind::Farmland => 3,

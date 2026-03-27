@@ -1,6 +1,6 @@
 use crate::constants::{CHUNK_SIZE_METERS, GIS_TO_WORLD_SCALE};
 use crate::geometry::compute_global_bounds;
-use crate::pyramid::{LevelSpoolWriter, build_parent_levels_from_spool, compute_pyramid_layout};
+use crate::pyramid::{PyramidStreamReducer, compute_pyramid_layout};
 use crate::rasterize::{build_chunk_polygon_index, stream_rasterized_chunks};
 use crate::terrain_extract::{build_polygons, collect_needed_nodes, collect_terrain_ways};
 use anyhow::{Context, Result, anyhow, ensure};
@@ -12,6 +12,7 @@ pub fn process_terrain_world(
     region: &str,
     raw_file_path: &Path,
     cells_per_side: usize,
+    raster_memory_gib: f64,
 ) -> Result<()> {
     ensure!(cells_per_side >= 2, "cells_per_side must be at least 2");
     ensure!(
@@ -22,6 +23,13 @@ pub fn process_terrain_world(
         u16::try_from(cells_per_side).is_ok(),
         "cells_per_side must fit into u16 metadata"
     );
+    ensure!(
+        raster_memory_gib.is_finite() && raster_memory_gib > 0.0,
+        "raster_memory_gib must be a positive finite number"
+    );
+
+    let raster_memory_budget_bytes =
+        (raster_memory_gib * 1024.0 * 1024.0 * 1024.0).round() as u64;
 
     println!("Scanning terrain ways from {:?}", raw_file_path);
     let (ways, needed_nodes) = collect_terrain_ways(raw_file_path)?;
@@ -88,49 +96,55 @@ pub fn process_terrain_world(
         "Rasterizing polygons into streamed terrain chunks (fixed chunk buffer)..."
     );
     let output_path = world_output_path(region);
-    let output_dir = output_path
-        .parent()
-        .ok_or_else(|| anyhow!("failed to resolve world output directory"))?;
     let mut world_writer = WorldWriter::new(&output_path)?;
 
-    let mut base_spool_writer = LevelSpoolWriter::create(
-        output_dir,
-        region,
-        "base",
+    let mut pyramid_stream = PyramidStreamReducer::new(
         pyramid_layout.playable_zoom_level,
         cells_per_side,
     )?;
+
+    let mut parent_tile_count = 0_usize;
 
     let base_tile_count = stream_rasterized_chunks(
         &polygons,
         &chunk_index,
         cells_per_side,
+        raster_memory_budget_bytes,
         |chunk_x, chunk_y, cells| {
             let tile_x = chunk_x + pyramid_layout.playable_tile_offset_x;
             let tile_y = chunk_y + pyramid_layout.playable_tile_offset_y;
+
+            if pyramid_layout.playable_zoom_level == 0 {
+                world_writer.write_tile(pyramid_layout.playable_zoom_level, tile_x, tile_y, cells)?;
+                return Ok(());
+            }
 
             world_writer.write_tile_from_slice(
                 pyramid_layout.playable_zoom_level,
                 tile_x,
                 tile_y,
-                cells,
+                &cells,
             )?;
-            base_spool_writer.append_tile(tile_x, tile_y, cells)?;
+
+            parent_tile_count += pyramid_stream.push_playable_tile(
+                tile_x,
+                tile_y,
+                cells,
+                &mut |zoom, parent_x, parent_y, parent_cells| {
+                    world_writer.write_tile_from_slice(zoom, parent_x, parent_y, parent_cells)
+                },
+            )?;
+
             Ok(())
         },
     )?;
 
-    println!("Building zoom pyramid from streamed base chunks...");
-    let base_level_path = base_spool_writer.finish()?;
-    let parent_tile_count = build_parent_levels_from_spool(
-        &base_level_path,
-        output_dir,
-        region,
-        cells_per_side,
-        pyramid_layout.playable_zoom_level,
-        |zoom, tile_x, tile_y, cells| world_writer.write_tile(zoom, tile_x, tile_y, cells),
-    )?;
-    let _ = std::fs::remove_file(&base_level_path);
+    if pyramid_layout.playable_zoom_level > 0 {
+        println!("Building zoom pyramid from streamed base chunks...");
+        parent_tile_count += pyramid_stream.finish(&mut |zoom, tile_x, tile_y, cells| {
+            world_writer.write_tile_from_slice(zoom, tile_x, tile_y, cells)
+        })?;
+    }
 
     let total_tile_count = base_tile_count + parent_tile_count;
 

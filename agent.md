@@ -23,7 +23,8 @@
 - Avoid synthetic tile subdivision that duplicates raster data; increase geometric detail through better source extraction or higher `--cells-per-side` instead.
 - For large map extracts, keep world generation streaming-first: do not collect the full tile pyramid or serialized world bytes in memory before writing.
 - Keep base raster generation chunk-streamed as well: avoid retaining `HashMap<(chunk_x, chunk_y), Vec<u8>>` for the whole map when processing large extracts.
-- Temporary streaming files that are written and later read must be opened with explicit read/write modes; avoid write-only descriptors in two-phase spool pipelines.
+- Prefer bounded in-memory row/window reducers over temporary spool files for pyramid/raster stages; keep tile emission ordered by `(tile_y, tile_x)` for deterministic output.
+- Respect `--raster-memory-gib` as the raster window budget control when tuning large-area generation stability.
 
 ## 5. Map-Gen Concurrency Safety
 - Parallelize terrain chunk cell computation with Rayon only when each worker writes to a chunk-local buffer.

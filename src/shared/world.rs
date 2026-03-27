@@ -1,18 +1,16 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use indicatif::{ProgressBar, ProgressStyle};
 use rkyv::{Archive, Deserialize, Serialize, access, rancor::Error as RkyvError, to_bytes};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const WORLD_MAGIC: &[u8; 8] = b"BDWORLD1";
-pub const WORLD_VERSION: u32 = 2;
+pub const WORLD_VERSION_V2: u32 = 2;
+pub const WORLD_VERSION_V3: u32 = 3;
+pub const WORLD_VERSION: u32 = WORLD_VERSION_V3;
 const WORLD_HEADER_SIZE: usize = 8 + 4 + 8;
 const MAP_ASSETS_DIR: &str = "assets/map";
-static WORLD_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[repr(u8)]
 #[derive(
@@ -124,10 +122,15 @@ pub struct WorldStreamReader {
 
 #[derive(Debug)]
 pub struct WorldWriter {
-    temp_tile_data_path: PathBuf,
-    temp_tile_data_file: File,
+    output_path: PathBuf,
+    world_file: File,
     tile_entries: Vec<TileMetadata>,
-    temp_tile_data_len: u64,
+    tile_data_len: u64,
+}
+
+enum HeaderInfo {
+    V2 { metadata_len: u64 },
+    V3 { metadata_offset: u64 },
 }
 
 pub fn map_assets_path() -> PathBuf {
@@ -152,25 +155,24 @@ pub fn write_world_file(
 
 impl WorldWriter {
     pub fn new(output_path: &Path) -> Result<Self> {
-        let temp_tile_data_path = build_temp_tile_data_path(output_path);
-        let temp_tile_data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_tile_data_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary world tile data file at {}",
-                    temp_tile_data_path.display()
-                )
-            })?;
+        let mut world_file = File::create(output_path).with_context(|| {
+            format!("failed to create world output at {}", output_path.display())
+        })?;
+        world_file
+            .write_all(WORLD_MAGIC)
+            .context("failed to write world magic")?;
+        world_file
+            .write_all(&WORLD_VERSION.to_le_bytes())
+            .context("failed to write world version")?;
+        world_file
+            .write_all(&0_u64.to_le_bytes())
+            .context("failed to write world metadata offset placeholder")?;
 
         Ok(Self {
-            temp_tile_data_path,
-            temp_tile_data_file,
+            output_path: output_path.to_path_buf(),
+            world_file,
             tile_entries: Vec::new(),
-            temp_tile_data_len: 0,
+            tile_data_len: 0,
         })
     }
 
@@ -189,18 +191,25 @@ impl WorldWriter {
             "serialized terrain tile is too large"
         );
 
-        self.temp_tile_data_file
+        let tile_offset = (WORLD_HEADER_SIZE as u64) + self.tile_data_len;
+
+        self.world_file
             .write_all(&bytes)
-            .context("failed to append serialized tile bytes to temporary world data")?;
+            .with_context(|| {
+                format!(
+                    "failed to append serialized tile bytes to {}",
+                    self.output_path.display()
+                )
+            })?;
 
         self.tile_entries.push(TileMetadata {
             zoom,
             tile_x,
             tile_y,
-            byte_offset: self.temp_tile_data_len,
+            byte_offset: tile_offset,
             byte_len: bytes.len() as u32,
         });
-        self.temp_tile_data_len += bytes.len() as u64;
+        self.tile_data_len += bytes.len() as u64;
 
         Ok(())
     }
@@ -223,65 +232,25 @@ impl WorldWriter {
         metadata.tile_count = self.tile_entries.len() as u32;
         metadata.tiles = self.tile_entries;
 
-        let probe_bytes = to_bytes::<RkyvError>(&metadata)
-            .map_err(|err| anyhow!("failed to serialize world metadata (probe): {err}"))?;
-        let metadata_len = probe_bytes.len() as u64;
-
-        let data_offset_base = (WORLD_HEADER_SIZE as u64) + metadata_len;
-        for entry in &mut metadata.tiles {
-            entry.byte_offset += data_offset_base;
-        }
-
         let metadata_bytes = to_bytes::<RkyvError>(&metadata)
             .map_err(|err| anyhow!("failed to serialize world metadata: {err}"))?;
 
-        ensure!(
-            metadata_bytes.len() as u64 == metadata_len,
-            "serialized metadata size changed after offset patch"
-        );
+        let metadata_offset = (WORLD_HEADER_SIZE as u64) + self.tile_data_len;
+        self.world_file
+            .write_all(&metadata_bytes)
+            .context("failed to write world metadata trailer")?;
 
-        self.temp_tile_data_file
+        self.world_file
+            .seek(SeekFrom::Start((WORLD_MAGIC.len() + std::mem::size_of::<u32>()) as u64))
+            .context("failed to seek to metadata pointer slot")?;
+        self.world_file
+            .write_all(&metadata_offset.to_le_bytes())
+            .context("failed to backfill metadata pointer")?;
+        self.world_file
             .flush()
-            .context("failed to flush temporary world tile bytes")?;
-        self.temp_tile_data_file
-            .seek(SeekFrom::Start(0))
-            .context("failed to rewind temporary world tile bytes")?;
+            .context("failed to flush world output file")?;
 
-        let mut world_file = File::create(output_path).with_context(|| {
-            format!("failed to create world output at {}", output_path.display())
-        })?;
-
-        world_file.write_all(WORLD_MAGIC)?;
-        world_file.write_all(&WORLD_VERSION.to_le_bytes())?;
-        world_file.write_all(&(metadata_len).to_le_bytes())?;
-        world_file.write_all(&metadata_bytes)?;
-
-        let copy_progress = ProgressBar::new(self.temp_tile_data_len);
-        if let Ok(style) = ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.green/blue} {bytes}/{total_bytes} world data",
-        ) {
-            copy_progress.set_style(style.progress_chars("##-"));
-        }
-
-        let mut copy_buffer = vec![0_u8; 1024 * 1024];
-        loop {
-            let bytes_read = self
-                .temp_tile_data_file
-                .read(&mut copy_buffer)
-                .context("failed while reading temporary world tile data")?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            world_file
-                .write_all(&copy_buffer[..bytes_read])
-                .context("failed while writing streamed world tile data")?;
-            copy_progress.inc(bytes_read as u64);
-        }
-        copy_progress.finish_with_message("World file write complete");
-
-        drop(self.temp_tile_data_file);
-        let _ = std::fs::remove_file(&self.temp_tile_data_path);
+        let _ = output_path;
 
         Ok(())
     }
@@ -291,11 +260,38 @@ impl WorldStreamReader {
     pub fn open(path: &Path) -> Result<Self> {
         let mut file = File::open(path)
             .with_context(|| format!("failed to open world file {}", path.display()))?;
-        let metadata_len = read_header(&mut file)?;
+        let header = read_header(&mut file)?;
 
-        let mut metadata_bytes = vec![0_u8; metadata_len as usize];
-        file.read_exact(&mut metadata_bytes)
-            .context("failed to read world metadata bytes")?;
+        let metadata_bytes = match header {
+            HeaderInfo::V2 { metadata_len } => {
+                let mut bytes = vec![0_u8; metadata_len as usize];
+                file.read_exact(&mut bytes)
+                    .context("failed to read v2 world metadata bytes")?;
+                bytes
+            }
+            HeaderInfo::V3 { metadata_offset } => {
+                let file_len = file
+                    .metadata()
+                    .with_context(|| format!("failed to stat world file {}", path.display()))?
+                    .len();
+                ensure!(
+                    metadata_offset <= file_len,
+                    "invalid metadata offset in world file"
+                );
+                let metadata_len = file_len - metadata_offset;
+                ensure!(
+                    usize::try_from(metadata_len).is_ok(),
+                    "world metadata too large for this platform"
+                );
+
+                file.seek(SeekFrom::Start(metadata_offset))
+                    .context("failed to seek to v3 world metadata")?;
+                let mut bytes = vec![0_u8; metadata_len as usize];
+                file.read_exact(&mut bytes)
+                    .context("failed to read v3 world metadata bytes")?;
+                bytes
+            }
+        };
 
         let archived = access::<ArchivedWorldMetadata, RkyvError>(&metadata_bytes)
             .map_err(|err| anyhow!("failed to access archived world metadata: {err}"))?;
@@ -355,7 +351,7 @@ impl WorldStreamReader {
     }
 }
 
-fn read_header(file: &mut File) -> Result<u64> {
+fn read_header(file: &mut File) -> Result<HeaderInfo> {
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)
         .context("failed to read world magic")?;
@@ -365,33 +361,19 @@ fn read_header(file: &mut File) -> Result<u64> {
     file.read_exact(&mut version_buf)
         .context("failed to read world version")?;
     let version = u32::from_le_bytes(version_buf);
-    ensure!(
-        version == WORLD_VERSION,
-        "unsupported world version: {version}"
-    );
 
-    let mut metadata_len_buf = [0_u8; 8];
-    file.read_exact(&mut metadata_len_buf)
-        .context("failed to read world metadata length")?;
+    let mut metadata_ptr_buf = [0_u8; 8];
+    file.read_exact(&mut metadata_ptr_buf)
+        .context("failed to read world metadata pointer")?;
+    let metadata_ptr = u64::from_le_bytes(metadata_ptr_buf);
 
-    Ok(u64::from_le_bytes(metadata_len_buf))
-}
-
-fn build_temp_tile_data_path(output_path: &Path) -> PathBuf {
-    let stem = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("world");
-
-    let unique_suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
-    let unique_counter = WORLD_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    output_path.with_file_name(format!(
-        ".{stem}.{}.{}.{}.tiles.tmp",
-        std::process::id(),
-        unique_suffix,
-        unique_counter
-    ))
+    match version {
+        WORLD_VERSION_V2 => Ok(HeaderInfo::V2 {
+            metadata_len: metadata_ptr,
+        }),
+        WORLD_VERSION_V3 => Ok(HeaderInfo::V3 {
+            metadata_offset: metadata_ptr,
+        }),
+        _ => Err(anyhow!("unsupported world version: {version}")),
+    }
 }
