@@ -8,16 +8,20 @@
 ## Data Pipeline
 - **Ingestion**: `map_gen` fetches PBF extracts from Geofabrik/BBBike.
 - **Processing (Terrain-first)**: `map_gen` parses terrain tags from both closed OSM ways and `type=multipolygon` relations (outer way members stitched into rings), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
-- **Detail Resolution**: `map_gen` raster detail is configurable via `--cells-per-side` (even integer, default `64`), controlling max playable detail as $\text{cell size} = \frac{1024m}{\text{cells per side}}$.
-- **Pyramid Bake**: `map_gen` now derives a sparse hierarchical tile pyramid from playable chunks (`zoom = playable..0`) by 2x downsampling each parent from 4 children.
+- **Detail Resolution**: `map_gen` raster detail is configurable via `--cells-per-side` (even integer, default `256`), controlling max playable detail as $\text{cell size} = \frac{1024m}{\text{cells per side}}$.
+- **Pyramid Bake**: `map_gen` derives a sparse hierarchical tile pyramid from real raster chunks only (`zoom = playable..0`) by 2x downsampling each parent from 4 children. No synthetic detail subdivision is generated.
 - **Storage**: Map assets are unified in `assets/map/`: source `.pbf` and processed `.world` files are separated by extension in the same directory.
 - **Format**: `.world` stores compact metadata + tile index keyed by `(zoom, tile_x, tile_y)` + per-tile `rkyv` archived payloads.
 - **Runtime Loading**: Metadata is loaded first; terrain tiles are loaded on-demand by camera zoom + visible bounds. Full world file must never be loaded all at once.
 
 ## Zoom LOD
-- `playable_zoom_level` is the highest-detail terrain level (normal gameplay).
-- Lower zooms are unplayable overview layers that progressively drop detail but keep continuity.
-- Runtime converts camera scale -> zoom level and only keeps visible tiles (plus margin) resident.
+- `playable_zoom_level` is the highest-detail terrain LOD available from real rasterized chunks.
+- Lower zooms are overview layers that progressively drop detail while preserving topology continuity.
+- Runtime camera zoom step `0` always fits the full map bounds on screen (with small padding) and uses LOD `0`.
+- Runtime can zoom in beyond the number of LOD levels to reach playable human-scale framing; when this happens, terrain remains on max LOD.
+- LOD selection is derived from camera scale and clamped to `0..playable_zoom_level`; only visible tiles (plus margin) stay resident.
+- Runtime zoom input is continuous (synthetic camera zoom), while LOD switches live on-the-fly with hysteresis around scale thresholds to avoid flicker/chatter at boundaries.
+- Playable camera framing is calibrated to target roughly `96m` visible across the viewport (street-level readability for a `1.8m` actor).
 - Pyramid downsampling now uses dominant-terrain voting per $2 \times 2$ sample window (with water-safe tie breaks) to prevent river/ocean classes from flooding land at overview zooms.
 
 ## Networking (Server-Authoritative)

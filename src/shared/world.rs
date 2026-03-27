@@ -1,8 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use rkyv::{
-    Archive, Deserialize, Serialize, access, rancor::Error as RkyvError,
-    to_bytes,
-};
+use rkyv::{Archive, Deserialize, Serialize, access, rancor::Error as RkyvError, to_bytes};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -15,17 +12,7 @@ const MAP_ASSETS_DIR: &str = "assets/map";
 
 #[repr(u8)]
 #[derive(
-    Archive,
-    Serialize,
-    Deserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
+    Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
 pub enum TerrainKind {
     Unknown = 0,
@@ -216,11 +203,7 @@ impl WorldStreamReader {
         let mut tiles = HashMap::with_capacity(archived.tiles.len());
         for entry in archived.tiles.iter() {
             tiles.insert(
-                (
-                    entry.zoom.into(),
-                    entry.tile_x.into(),
-                    entry.tile_y.into(),
-                ),
+                (entry.zoom.into(), entry.tile_x.into(), entry.tile_y.into()),
                 ChunkLocation {
                     byte_offset: entry.byte_offset.into(),
                     byte_len: entry.byte_len.into(),
@@ -266,9 +249,7 @@ impl WorldStreamReader {
             })?;
         self.file
             .read_exact(&mut data)
-            .with_context(|| {
-                format!("failed to read tile ({zoom}, {tile_x}, {tile_y}) bytes")
-            })?;
+            .with_context(|| format!("failed to read tile ({zoom}, {tile_x}, {tile_y}) bytes"))?;
 
         Ok(Some(data))
     }

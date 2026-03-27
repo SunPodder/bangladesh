@@ -37,9 +37,9 @@ fn paint_polygon_into_chunks(
                 continue;
             }
 
-            let cells = chunk_cells.entry((chunk_x, chunk_y)).or_insert_with(|| {
-                vec![DEFAULT_TERRAIN.code(); cells_per_side * cells_per_side]
-            });
+            let cells = chunk_cells
+                .entry((chunk_x, chunk_y))
+                .or_insert_with(|| vec![DEFAULT_TERRAIN.code(); cells_per_side * cells_per_side]);
 
             for iy in min_iy..max_iy {
                 for ix in min_ix..max_ix {

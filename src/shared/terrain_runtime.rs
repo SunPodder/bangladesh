@@ -1,5 +1,5 @@
 use crate::shared::world::{
-    ArchivedTerrainTile, TerrainKind, WorldStreamReader, WorldIndex, world_output_path,
+    ArchivedTerrainTile, TerrainKind, WorldIndex, WorldStreamReader, world_output_path,
 };
 use anyhow::{Result, anyhow, ensure};
 use bevy::input::mouse::MouseWheel;
@@ -23,7 +23,11 @@ struct TerrainRuntimeConfig {
     region: String,
     movement_speed: f32,
     zoom_lerp_speed: f32,
+    zoom_wheel_sensitivity_steps: f32,
+    lod_hysteresis_ratio: f32,
     preload_margin_tiles: i32,
+    playable_view_width_m: f32,
+    overview_padding_ratio: f32,
 }
 
 #[derive(Resource)]
@@ -32,12 +36,17 @@ struct TerrainWorldState {
     loaded_tiles: HashMap<(u8, i32, i32), LoadedTile>,
     cells_per_side: usize,
     playable_chunk_size_m: f32,
+    full_map_scale: f32,
+    lod_playable_scale: f32,
     current_zoom_level: u8,
+    current_zoom_step: f32,
 }
 
 #[derive(Resource)]
 struct ZoomController {
-    target_zoom_level: u8,
+    max_zoom_step: u8,
+    min_scale: f32,
+    max_scale: f32,
     target_scale: f32,
 }
 
@@ -66,11 +75,18 @@ impl Plugin for TerrainStreamingPlugin {
             region: self.region.clone(),
             movement_speed: 900.0,
             zoom_lerp_speed: 8.0,
+            zoom_wheel_sensitivity_steps: 0.25,
+            lod_hysteresis_ratio: 0.10,
             preload_margin_tiles: 1,
+            playable_view_width_m: 96.0,
+            overview_padding_ratio: 1.08,
         });
         app.insert_resource(DebugOverlayState::default());
 
-        app.add_systems(Startup, (setup_terrain_view, setup_debug_overlay, open_world).chain());
+        app.add_systems(
+            Startup,
+            (setup_terrain_view, setup_debug_overlay, open_world).chain(),
+        );
         app.add_systems(
             Update,
             (
@@ -92,7 +108,7 @@ fn setup_terrain_view(mut commands: Commands) {
 
     commands.spawn((
         StreamPlayer,
-        Sprite::from_color(Color::srgb(1.0, 0.2, 0.2), Vec2::splat(10.0)),
+        Sprite::from_color(Color::srgb(1.0, 0.2, 0.2), Vec2::new(0.9, 1.8)),
         Transform::from_xyz(0.0, 0.0, 10.0),
     ));
 }
@@ -127,6 +143,7 @@ fn setup_debug_overlay(mut commands: Commands) {
 fn open_world(
     mut commands: Commands,
     config: Res<TerrainRuntimeConfig>,
+    window_query: Query<&Window, With<PrimaryWindow>>,
     mut camera_query: Query<&mut Projection, With<Camera2d>>,
     mut player_query: Query<&mut Transform, With<StreamPlayer>>,
 ) {
@@ -134,10 +151,8 @@ fn open_world(
 
     match WorldStreamReader::open(&world_path) {
         Ok(reader) => {
-            let start_x =
-                (reader.index.local_bounds_min_x + reader.index.local_bounds_max_x) * 0.5;
-            let start_y =
-                (reader.index.local_bounds_min_y + reader.index.local_bounds_max_y) * 0.5;
+            let start_x = (reader.index.local_bounds_min_x + reader.index.local_bounds_max_x) * 0.5;
+            let start_y = (reader.index.local_bounds_min_y + reader.index.local_bounds_max_y) * 0.5;
 
             if let Ok(mut player_transform) = player_query.single_mut() {
                 player_transform.translation.x = start_x;
@@ -151,30 +166,72 @@ fn open_world(
                 reader.index.playable_zoom_level,
             );
             info!(
-                "Playable terrain detail: {:.2}m per cell (chunk {:.1}m / {} cells)",
+                "Playable terrain detail: {:.2}m per cell (tile {:.1}m / {} cells)",
                 reader.index.chunk_size_m / f32::from(reader.index.cells_per_side),
                 reader.index.chunk_size_m,
                 reader.index.cells_per_side,
             );
 
+            let window = window_query.single().ok();
+            let window_width = window.map(Window::width).unwrap_or(1280.0);
+            let window_height = window.map(Window::height).unwrap_or(720.0);
+
+            let map_width =
+                (reader.index.local_bounds_max_x - reader.index.local_bounds_min_x).abs();
+            let map_height =
+                (reader.index.local_bounds_max_y - reader.index.local_bounds_min_y).abs();
+
+            let full_map_scale = fit_scale_for_bounds(
+                window_width,
+                window_height,
+                map_width,
+                map_height,
+                config.overview_padding_ratio,
+            );
+            let desired_playable_scale =
+                scale_for_view_width(window_width, config.playable_view_width_m);
+            let max_zoom_step = zoom_steps_for_target(full_map_scale, desired_playable_scale);
+            let playable_scale = scale_for_zoom_step(full_map_scale, max_zoom_step);
+
+            let playable_zoom_level = reader.index.playable_zoom_level;
+            let lod_playable_scale = scale_for_zoom_step(full_map_scale, playable_zoom_level);
+
+            info!(
+                "Zoom profile: zoom-0 fits {:.0}m x {:.0}m (scale {:.5}), playable target {:.1}m across (step {}, scale {:.5})",
+                map_width,
+                map_height,
+                full_map_scale,
+                config.playable_view_width_m,
+                max_zoom_step,
+                playable_scale,
+            );
+            info!(
+                "LOD profile: terrain zoom 0..{} (max LOD reached by zoom step {})",
+                playable_zoom_level, playable_zoom_level,
+            );
+
             if let Ok(mut projection) = camera_query.single_mut() {
                 if let Projection::Orthographic(ortho) = projection.as_mut() {
-                    ortho.scale = 1.0;
+                    ortho.scale = playable_scale;
                 }
             }
 
-            let playable_zoom_level = reader.index.playable_zoom_level;
             commands.insert_resource(TerrainWorldState {
                 cells_per_side: usize::from(reader.index.cells_per_side),
                 playable_chunk_size_m: reader.index.chunk_size_m,
+                full_map_scale,
+                lod_playable_scale,
                 reader,
                 loaded_tiles: HashMap::new(),
                 current_zoom_level: playable_zoom_level,
+                current_zoom_step: f32::from(max_zoom_step),
             });
 
             commands.insert_resource(ZoomController {
-                target_zoom_level: playable_zoom_level,
-                target_scale: 1.0,
+                max_zoom_step,
+                min_scale: playable_scale,
+                max_scale: full_map_scale,
+                target_scale: playable_scale,
             });
         }
         Err(error) => {
@@ -221,45 +278,34 @@ fn move_player(
 }
 
 fn handle_zoom_input(
+    config: Res<TerrainRuntimeConfig>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut wheel_events: MessageReader<MouseWheel>,
     zoom_controller: Option<ResMut<ZoomController>>,
-    state: Option<Res<TerrainWorldState>>,
 ) {
     let Some(mut zoom_controller) = zoom_controller else {
         return;
     };
-    let Some(state) = state else {
-        return;
-    };
 
-    let mut steps = 0_i32;
+    let mut steps = 0.0_f32;
     for event in wheel_events.read() {
-        if event.y > 0.0 {
-            steps += 1;
-        } else if event.y < 0.0 {
-            steps -= 1;
-        }
+        steps += event.y;
     }
 
     if keyboard.just_pressed(KeyCode::Equal) || keyboard.just_pressed(KeyCode::NumpadAdd) {
-        steps += 1;
+        steps += 1.0;
     }
     if keyboard.just_pressed(KeyCode::Minus) || keyboard.just_pressed(KeyCode::NumpadSubtract) {
-        steps -= 1;
+        steps -= 1.0;
     }
 
-    if steps == 0 {
+    if steps.abs() < f32::EPSILON {
         return;
     }
 
-    let playable_zoom = i32::from(state.reader.index.playable_zoom_level);
-    let next_zoom = (i32::from(zoom_controller.target_zoom_level) + steps).clamp(0, playable_zoom);
-    zoom_controller.target_zoom_level = next_zoom as u8;
-    zoom_controller.target_scale = scale_for_zoom(
-        state.reader.index.playable_zoom_level,
-        zoom_controller.target_zoom_level,
-    );
+    let zoom_factor = 2.0_f32.powf(-steps * config.zoom_wheel_sensitivity_steps);
+    zoom_controller.target_scale = (zoom_controller.target_scale * zoom_factor)
+        .clamp(zoom_controller.min_scale, zoom_controller.max_scale);
 }
 
 fn smooth_zoom_camera(
@@ -330,6 +376,7 @@ fn toggle_debug_overlay(
 fn update_debug_overlay_text(
     overlay_state: Res<DebugOverlayState>,
     state: Option<Res<TerrainWorldState>>,
+    zoom_controller: Option<Res<ZoomController>>,
     player_query: Query<&Transform, With<StreamPlayer>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
     window_query: Query<&Window, With<PrimaryWindow>>,
@@ -369,13 +416,28 @@ fn update_debug_overlay_text(
         .map(|world_state| world_state.current_zoom_level.to_string())
         .unwrap_or_else(|| "N/A".to_string());
 
+    let zoom_step_text = match (state.as_ref(), zoom_controller.as_ref()) {
+        (Some(world_state), Some(controller)) => {
+            format!(
+                "{:.2}/{}",
+                world_state.current_zoom_step, controller.max_zoom_step
+            )
+        }
+        _ => "N/A".to_string(),
+    };
+
     let cursor_text = cursor_coords
         .map(|coords| format!("{:.1}, {:.1}", coords.x, coords.y))
         .unwrap_or_else(|| "N/A".to_string());
 
     text.0 = format!(
-        "F3 Debug\nPlayer: ({:.1}, {:.1}, {:.1})\nCursor: ({})\nZoom: {}",
-        player_coords.0, player_coords.1, player_coords.2, cursor_text, zoom_level_text
+        "F3 Debug\nPlayer: ({:.1}, {:.1}, {:.1})\nCursor: ({})\nLOD Zoom: {}\nCamera Zoom Step: {}",
+        player_coords.0,
+        player_coords.1,
+        player_coords.2,
+        cursor_text,
+        zoom_level_text,
+        zoom_step_text,
     );
 }
 
@@ -399,8 +461,15 @@ fn update_map_lod(
     };
 
     let camera_scale = ortho_projection.scale;
-    let desired_zoom = scale_to_zoom(state.reader.index.playable_zoom_level, camera_scale);
+    let desired_zoom = select_lod_with_hysteresis(
+        state.reader.index.playable_zoom_level,
+        state.lod_playable_scale,
+        camera_scale,
+        state.current_zoom_level,
+        config.lod_hysteresis_ratio,
+    );
     state.current_zoom_level = desired_zoom;
+    state.current_zoom_step = zoom_progress_for_scale(state.full_map_scale, camera_scale);
 
     let Ok(window) = window_query.single() else {
         return;
@@ -414,14 +483,14 @@ fn update_map_lod(
     let min_y = camera_transform.translation.y - half_height;
     let max_y = camera_transform.translation.y + half_height;
 
-    let min_tile_x = world_to_tile_x(&state.reader.index, desired_zoom, min_x)
-        - config.preload_margin_tiles;
-    let max_tile_x = world_to_tile_x(&state.reader.index, desired_zoom, max_x)
-        + config.preload_margin_tiles;
-    let min_tile_y = world_to_tile_y(&state.reader.index, desired_zoom, min_y)
-        - config.preload_margin_tiles;
-    let max_tile_y = world_to_tile_y(&state.reader.index, desired_zoom, max_y)
-        + config.preload_margin_tiles;
+    let min_tile_x =
+        world_to_tile_x(&state.reader.index, desired_zoom, min_x) - config.preload_margin_tiles;
+    let max_tile_x =
+        world_to_tile_x(&state.reader.index, desired_zoom, max_x) + config.preload_margin_tiles;
+    let min_tile_y =
+        world_to_tile_y(&state.reader.index, desired_zoom, min_y) - config.preload_margin_tiles;
+    let max_tile_y =
+        world_to_tile_y(&state.reader.index, desired_zoom, max_y) + config.preload_margin_tiles;
 
     let mut desired_tiles = HashSet::new();
     for tile_y in min_tile_y..=max_tile_y {
@@ -512,9 +581,7 @@ fn spawn_tile_entities(
     let archived_tile_x: i32 = archived.tile_x.into();
     let archived_tile_y: i32 = archived.tile_y.into();
     ensure!(
-        u8::from(archived.zoom) == zoom
-            && archived_tile_x == tile_x
-            && archived_tile_y == tile_y,
+        u8::from(archived.zoom) == zoom && archived_tile_x == tile_x && archived_tile_y == tile_y,
         "tile metadata mismatch while loading tile"
     );
 
@@ -574,23 +641,83 @@ fn terrain_color(terrain: TerrainKind) -> Color {
     }
 }
 
-fn scale_for_zoom(playable_zoom_level: u8, zoom_level: u8) -> f32 {
-    if zoom_level >= playable_zoom_level {
-        return 1.0;
-    }
-
-    let steps_out = i32::from(playable_zoom_level - zoom_level);
-    2.0_f32.powi(steps_out)
+fn scale_for_view_width(window_width: f32, view_width_m: f32) -> f32 {
+    let safe_width = window_width.max(1.0);
+    (view_width_m / safe_width).max(0.0001)
 }
 
-fn scale_to_zoom(playable_zoom_level: u8, scale: f32) -> u8 {
-    if scale <= 1.0 {
-        return playable_zoom_level;
+fn fit_scale_for_bounds(
+    window_width: f32,
+    window_height: f32,
+    bounds_width: f32,
+    bounds_height: f32,
+    padding_ratio: f32,
+) -> f32 {
+    let safe_width = window_width.max(1.0);
+    let safe_height = window_height.max(1.0);
+    let fit_x = bounds_width.max(1.0) / safe_width;
+    let fit_y = bounds_height.max(1.0) / safe_height;
+    (fit_x.max(fit_y) * padding_ratio.max(1.0)).max(0.0001)
+}
+
+fn zoom_steps_for_target(full_map_scale: f32, target_scale: f32) -> u8 {
+    let full = full_map_scale.max(0.0001);
+    let target = target_scale.max(0.0001);
+    if full <= target {
+        return 0;
     }
 
-    let steps_out = scale.log2().round() as i32;
-    let zoom = i32::from(playable_zoom_level) - steps_out;
-    zoom.clamp(0, i32::from(playable_zoom_level)) as u8
+    (full / target).log2().ceil().max(0.0) as u8
+}
+
+fn scale_for_zoom_step(full_map_scale: f32, zoom_step: u8) -> f32 {
+    full_map_scale / 2.0_f32.powi(i32::from(zoom_step))
+}
+
+fn zoom_progress_for_scale(full_map_scale: f32, scale: f32) -> f32 {
+    let safe_scale = scale.max(0.0001);
+    if safe_scale >= full_map_scale {
+        return 0.0;
+    }
+
+    (full_map_scale / safe_scale).log2().max(0.0)
+}
+
+fn scale_for_lod(playable_zoom_level: u8, zoom_level: u8, playable_lod_scale: f32) -> f32 {
+    let steps_out = i32::from(playable_zoom_level) - i32::from(zoom_level);
+    playable_lod_scale * 2.0_f32.powi(steps_out.max(0))
+}
+
+fn select_lod_with_hysteresis(
+    playable_zoom_level: u8,
+    playable_lod_scale: f32,
+    scale: f32,
+    current_zoom_level: u8,
+    hysteresis_ratio: f32,
+) -> u8 {
+    let mut zoom = i32::from(current_zoom_level).clamp(0, i32::from(playable_zoom_level));
+    let hysteresis = (1.0 + hysteresis_ratio.max(0.0)).max(1.0);
+    let sqrt_two = std::f32::consts::SQRT_2;
+
+    for _ in 0..=playable_zoom_level {
+        let level_scale = scale_for_lod(playable_zoom_level, zoom as u8, playable_lod_scale);
+        let zoom_out_threshold = level_scale * sqrt_two * hysteresis;
+        let zoom_in_threshold = (level_scale / sqrt_two) / hysteresis;
+
+        if zoom > 0 && scale > zoom_out_threshold {
+            zoom -= 1;
+            continue;
+        }
+
+        if zoom < i32::from(playable_zoom_level) && scale < zoom_in_threshold {
+            zoom += 1;
+            continue;
+        }
+
+        break;
+    }
+
+    zoom as u8
 }
 
 fn world_to_tile_x(index: &WorldIndex, zoom_level: u8, world_x: f32) -> i32 {

@@ -174,50 +174,48 @@ pub fn collect_terrain_ways(pbf_path: &Path) -> Result<(Vec<RawTerrainWay>, Hash
 
     ElementReader::from_path(pbf_path)
         .with_context(|| format!("failed to open pbf file {}", pbf_path.display()))?
-        .for_each(|element| {
-            match element {
-                Element::Way(way) => {
-                    let Some(terrain) = classify_way_terrain(&way) else {
-                        return;
-                    };
+        .for_each(|element| match element {
+            Element::Way(way) => {
+                let Some(terrain) = classify_way_terrain(&way) else {
+                    return;
+                };
 
-                    let refs: Vec<i64> = way.refs().collect();
-                    if refs.len() < 4 || refs.first() != refs.last() {
-                        return;
+                let refs: Vec<i64> = way.refs().collect();
+                if refs.len() < 4 || refs.first() != refs.last() {
+                    return;
+                }
+
+                closed_ways.push(RawTerrainWay {
+                    terrain,
+                    node_refs: refs,
+                });
+            }
+            Element::Relation(relation) => {
+                let Some(terrain) = classify_relation_terrain(&relation) else {
+                    return;
+                };
+
+                let mut outer_way_ids = Vec::new();
+                for member in relation.members() {
+                    if member.member_type != RelMemberType::Way {
+                        continue;
                     }
 
-                    closed_ways.push(RawTerrainWay {
+                    let role = member.role().unwrap_or("");
+                    if role == "outer" || role.is_empty() {
+                        outer_way_ids.push(member.member_id);
+                        relation_way_ids.insert(member.member_id);
+                    }
+                }
+
+                if !outer_way_ids.is_empty() {
+                    terrain_relations.push(TerrainRelation {
                         terrain,
-                        node_refs: refs,
+                        outer_way_ids,
                     });
                 }
-                Element::Relation(relation) => {
-                    let Some(terrain) = classify_relation_terrain(&relation) else {
-                        return;
-                    };
-
-                    let mut outer_way_ids = Vec::new();
-                    for member in relation.members() {
-                        if member.member_type != RelMemberType::Way {
-                            continue;
-                        }
-
-                        let role = member.role().unwrap_or("");
-                        if role == "outer" || role.is_empty() {
-                            outer_way_ids.push(member.member_id);
-                            relation_way_ids.insert(member.member_id);
-                        }
-                    }
-
-                    if !outer_way_ids.is_empty() {
-                        terrain_relations.push(TerrainRelation {
-                            terrain,
-                            outer_way_ids,
-                        });
-                    }
-                }
-                _ => {}
             }
+            _ => {}
         })
         .context("failed during terrain-way/relation scan")?;
 

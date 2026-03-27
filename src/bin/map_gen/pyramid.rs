@@ -1,3 +1,4 @@
+use crate::constants::CHUNK_SIZE_METERS;
 use crate::constants::DEFAULT_TERRAIN;
 use anyhow::{Result, anyhow, ensure};
 use bangladesh::shared::world::{TerrainKind, TerrainTile};
@@ -88,7 +89,7 @@ fn downsample_parent_tile(children: [Option<&Vec<u8>>; 4], cells_per_side: usize
 pub fn generate_tile_pyramid(
     base_chunks: HashMap<(i32, i32), Vec<u8>>,
     cells_per_side: usize,
-) -> Result<(Vec<TerrainTile>, u8, i32, i32)> {
+) -> Result<(Vec<TerrainTile>, u8, i32, i32, f32)> {
     ensure!(
         !base_chunks.is_empty(),
         "cannot build tile pyramid from an empty playable chunk set"
@@ -112,21 +113,24 @@ pub fn generate_tile_pyramid(
 
     let width = (max_chunk_x - min_chunk_x + 1) as u32;
     let height = (max_chunk_y - min_chunk_y + 1) as u32;
-    let playable_zoom_level = ceil_log2(width.max(height));
+    let overview_zoom_levels = ceil_log2(width.max(height));
+    let playable_zoom_level = overview_zoom_levels;
 
-    let grid_side = 1_i32
-        .checked_shl(playable_zoom_level as u32)
-        .ok_or_else(|| anyhow!("playable zoom level too large for i32 tile coordinates"))?;
+    let chunk_grid_side = 1_i32
+        .checked_shl(overview_zoom_levels as u32)
+        .ok_or_else(|| anyhow!("overview zoom level too large for i32 tile coordinates"))?;
 
-    let playable_tile_offset_x = -min_chunk_x + (grid_side - width as i32) / 2;
-    let playable_tile_offset_y = -min_chunk_y + (grid_side - height as i32) / 2;
+    let chunk_offset_x = -min_chunk_x + (chunk_grid_side - width as i32) / 2;
+    let chunk_offset_y = -min_chunk_y + (chunk_grid_side - height as i32) / 2;
+
+    let playable_tile_offset_x = chunk_offset_x;
+    let playable_tile_offset_y = chunk_offset_y;
 
     let mut current_level = HashMap::with_capacity(base_chunks.len());
     for ((chunk_x, chunk_y), cells) in base_chunks {
-        current_level.insert(
-            (chunk_x + playable_tile_offset_x, chunk_y + playable_tile_offset_y),
-            cells,
-        );
+        let tile_x = chunk_x + chunk_offset_x;
+        let tile_y = chunk_y + chunk_offset_y;
+        current_level.insert((tile_x, tile_y), cells);
     }
 
     let mut all_tiles = Vec::new();
@@ -169,11 +173,13 @@ pub fn generate_tile_pyramid(
     }
 
     all_tiles.sort_by_key(|tile| (tile.zoom, tile.tile_y, tile.tile_x));
+    let playable_tile_size_m = CHUNK_SIZE_METERS as f32;
     Ok((
         all_tiles,
         playable_zoom_level,
         playable_tile_offset_x,
         playable_tile_offset_y,
+        playable_tile_size_m,
     ))
 }
 

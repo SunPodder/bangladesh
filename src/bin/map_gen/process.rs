@@ -8,10 +8,20 @@ use bangladesh::shared::world::{WorldMetadata, world_output_path, write_world_fi
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn process_terrain_world(region: &str, raw_file_path: &Path, cells_per_side: usize) -> Result<()> {
+pub fn process_terrain_world(
+    region: &str,
+    raw_file_path: &Path,
+    cells_per_side: usize,
+) -> Result<()> {
     ensure!(cells_per_side >= 2, "cells_per_side must be at least 2");
-    ensure!(cells_per_side % 2 == 0, "cells_per_side must be even for 2x downsampling");
-    ensure!(u16::try_from(cells_per_side).is_ok(), "cells_per_side must fit into u16 metadata");
+    ensure!(
+        cells_per_side % 2 == 0,
+        "cells_per_side must be even for 2x downsampling"
+    );
+    ensure!(
+        u16::try_from(cells_per_side).is_ok(),
+        "cells_per_side must fit into u16 metadata"
+    );
 
     println!("Scanning terrain ways from {:?}", raw_file_path);
     let (ways, needed_nodes) = collect_terrain_ways(raw_file_path)?;
@@ -31,7 +41,10 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path, cells_per_side:
     println!("Resolved {} referenced nodes", node_lookup.len());
 
     let (mut polygons, skipped_polygons) = build_polygons(ways, &node_lookup);
-    ensure!(!polygons.is_empty(), "no valid polygons after node resolution");
+    ensure!(
+        !polygons.is_empty(),
+        "no valid polygons after node resolution"
+    );
 
     println!(
         "Built {} terrain polygons (skipped {})",
@@ -39,8 +52,8 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path, cells_per_side:
         skipped_polygons
     );
 
-    let global_bounds =
-        compute_global_bounds(&polygons).ok_or_else(|| anyhow!("failed to compute polygon bounds"))?;
+    let global_bounds = compute_global_bounds(&polygons)
+        .ok_or_else(|| anyhow!("failed to compute polygon bounds"))?;
 
     let mercator_origin_x = (global_bounds.min_x / CHUNK_SIZE_METERS).floor() * CHUNK_SIZE_METERS;
     let mercator_origin_y = (global_bounds.min_y / CHUNK_SIZE_METERS).floor() * CHUNK_SIZE_METERS;
@@ -66,13 +79,22 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path, cells_per_side:
     );
 
     println!("Building zoom pyramid tiles from playable chunks...");
-    let (tiles, playable_zoom_level, playable_tile_offset_x, playable_tile_offset_y) =
-        generate_tile_pyramid(chunk_cells, cells_per_side)?;
+    let (
+        tiles,
+        playable_zoom_level,
+        playable_tile_offset_x,
+        playable_tile_offset_y,
+        playable_tile_size_m,
+    ) = generate_tile_pyramid(chunk_cells, cells_per_side)?;
 
     println!(
         "Generated {} total tiles across zoom levels 0..{}",
         tiles.len(),
         playable_zoom_level
+    );
+    println!(
+        "Playable tile size: {:.2}m (generator chunk {:.2}m)",
+        playable_tile_size_m, CHUNK_SIZE_METERS,
     );
 
     let generated_unix_seconds = SystemTime::now()
@@ -84,7 +106,7 @@ pub fn process_terrain_world(region: &str, raw_file_path: &Path, cells_per_side:
         region: region.to_string(),
         source_pbf: raw_file_path.display().to_string(),
         generated_unix_seconds,
-        chunk_size_m: CHUNK_SIZE_METERS as f32,
+        chunk_size_m: playable_tile_size_m,
         cells_per_side: cells_per_side as u16,
         playable_zoom_level,
         playable_tile_offset_x,

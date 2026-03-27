@@ -1,6 +1,6 @@
+use crate::constants::DEFAULT_CELLS_PER_SIDE;
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use crate::constants::DEFAULT_CELLS_PER_SIDE;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "OSM Data Downloader & Processor")]
