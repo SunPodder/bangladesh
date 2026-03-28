@@ -36,6 +36,8 @@
 - Playable camera framing is calibrated to target roughly `96m` visible across the viewport (street-level readability for a `1.8m` actor).
 - Pyramid downsampling now uses dominant-terrain voting per $2 \times 2$ sample window (with water-safe tie breaks) to prevent river/ocean classes from flooding land at overview zooms.
 - LOD water retention rule: for $2 \times 2$ windows with a 2-2 tie, edge-connected water pairs (row/column continuity) win to preserve major river channels in zoom 0 overviews; diagonal water pairs still defer to land tie-break priorities.
+- LOD road retention rule: for $2 \times 2$ windows with a 2-2 tie, edge-connected road pairs (row/column continuity) win to preserve major road corridors in zoom 0 overviews; diagonal road pairs still defer to dominant-terrain/tie-break resolution.
+- Low-LOD road topology cleanup (zoom `0..2`): after parent-tile downsampling, roads are deterministically de-clustered (dense interior erosion), orphan/island segments are pruned, and linear gaps are bridged so overview roads remain continuous guidance lines instead of scattered noise or solid road blocks.
 
 ## Networking (Server-Authoritative)
 - **Library**: `lightyear`.

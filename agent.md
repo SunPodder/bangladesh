@@ -30,6 +30,8 @@
 - Keep Bangladesh-local `landuse=*`, `leisure=*`, and `natural=*` variants in the terrain filters when unmatched fallback logs identify recurring values (for example `reservoir`, `slum`, `park`, `scrub`).
 - Keep tag-to-terrain mapping and best-match priority logic in `src/bin/map_gen/terrain_tag_filters.rs`; when default terrain fallback triggers, preserve logging of unmatched area-hint tags for filter expansion work.
 - In pyramid downsampling tie cases, preserve water only when a 2-2 tie forms an edge-connected strip (row/column) so major rivers remain visible in zoom 0 without letting diagonal/noisy water speckles spread.
+- In pyramid downsampling tie cases, preserve roads only when a 2-2 tie forms an edge-connected strip (row/column) so major corridors remain visible in zoom 0 without letting diagonal/speckle road noise spread.
+- For small overview LODs (zoom `0..2`), keep roads corridor-like: apply deterministic post-downsample cleanup to remove orphan/island road speckles and erode dense road blobs while preserving continuous major guidance lines.
 - Keep GIS as the macro source of truth, but allow deterministic per-chunk procedural continuity repair after rasterization (bridge 1-cell road/water breaks, trim short dangling road stubs, and keep river-like water components flowing); preserve chunk-edge segments to avoid cutting cross-chunk continuity.
 
 ## 5. Map-Gen Concurrency Safety
