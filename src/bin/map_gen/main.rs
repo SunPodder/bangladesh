@@ -10,12 +10,12 @@ mod validate;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use scan::{GenerateArgs, scan_pbf};
-use std::collections::HashSet;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use validate::{SpatialIndex, build_tile};
 
 #[derive(Debug, Parser)]
@@ -42,29 +42,45 @@ fn main() -> Result<()> {
 }
 
 fn generate(args: GenerateArgs) -> Result<()> {
-    if let Some(threads) = args.threads {
-        ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .ok();
-    }
+    let pbf_path = args.pbf_path();
+    let output_dir = args.output_dir();
+    let thread_count = args
+        .threads
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+    let pool = ThreadPoolBuilder::new().num_threads(thread_count).build()?;
 
-    fs::create_dir_all(&args.output_dir)
-        .with_context(|| format!("failed to create output dir {}", args.output_dir.display()))?;
-    clear_previous_outputs(&args.output_dir)?;
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create output dir {}", output_dir.display()))?;
 
-    println!("Scanning {}...", args.pbf_path.display());
+    println!("Scanning {}...", pbf_path.display());
     let (grid, scan) = scan_pbf(&args)?;
     println!(
-        "Grid: {} cols x {} rows, {} selected tile(s), {} LOD(s)",
+        "Grid: {} cols x {} rows, {} total tile(s), {} selected tile(s), ~{} chunk(s), {} LOD(s)",
         grid.cols,
         grid.rows,
+        grid.cols * grid.rows,
         scan.selected_tile_ids.len(),
+        scan.total_chunks_estimate,
         scan.lods.len()
     );
 
+    let index_writer =
+        index::IndexWriter::prepare(&output_dir, &args.region, &pbf_path, grid, &scan)?;
+    let already_generated = index_writer.generated_tile_ids();
+    println!(
+        "Index initialized at {} with {} baked tile(s) already present",
+        output_dir.join("map_index.json").display(),
+        already_generated.len()
+    );
+
+    let selected_tiles = scan
+        .selected_tile_ids
+        .iter()
+        .map(|tile_id| scan.tile_specs[*tile_id as usize])
+        .collect::<Vec<_>>();
+
     println!("Parsing OSM entities once for shared tile generation...");
-    let parsed = parse::parse_map_data(&args.pbf_path)?;
+    let parsed = parse::parse_map_data(&pbf_path)?;
     println!(
         "Parsed {} areas, {} buildings, {} roads, {} POIs",
         parsed.areas.len(),
@@ -74,75 +90,52 @@ fn generate(args: GenerateArgs) -> Result<()> {
     );
 
     let spatial_index = SpatialIndex::build(&parsed);
-    let selected = scan
-        .selected_tile_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let selected_tiles = scan
-        .tile_specs
-        .iter()
-        .copied()
-        .filter(|tile| selected.contains(&tile.id))
-        .collect::<Vec<_>>();
+    let progress = if args.progress {
+        let progress = ProgressBar::new(selected_tiles.len() as u64);
+        progress.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} tiles ({percent}%) eta {eta_precise}",
+            )?
+            .progress_chars("##-"),
+        );
+        Some(progress)
+    } else {
+        None
+    };
+    let index_writer = Arc::new(Mutex::new(index_writer));
 
-    let progress = args
-        .progress
-        .then(|| ProgressBar::new(selected_tiles.len() as u64));
+    let results = pool.install(|| {
+        selected_tiles
+            .par_iter()
+            .map(|tile_spec| {
+                let tile = build_tile(*tile_spec, &scan.lods, &parsed, &spatial_index)?;
+                let manifest = serialize::write_tile(&output_dir, *tile_spec, &tile)?;
+                {
+                    let mut writer = index_writer
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("map index writer lock poisoned"))?;
+                    writer.record_tile(manifest)?;
+                }
+                if let Some(progress) = &progress {
+                    progress.inc(1);
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .collect::<Vec<_>>()
+    });
 
-    let results = selected_tiles
-        .par_iter()
-        .map(|tile_spec| {
-            let tile = build_tile(*tile_spec, &scan.lods, &parsed, &spatial_index)?;
-            let manifest = serialize::write_tile(&args.output_dir, *tile_spec, &tile)?;
-            if let Some(progress) = &progress {
-                progress.inc(1);
-            }
-            Ok::<_, anyhow::Error>(manifest)
-        })
-        .collect::<Vec<_>>();
+    for result in results {
+        result?;
+    }
 
     if let Some(progress) = &progress {
         progress.finish_and_clear();
     }
 
-    let mut manifests = Vec::with_capacity(results.len());
-    for result in results {
-        manifests.push(result?);
-    }
-
-    index::write_index(
-        &args.output_dir,
-        &args.region,
-        &args.pbf_path,
-        grid,
-        &scan,
-        manifests,
-    )?;
-
-    println!("Wrote map bundle to {}", args.output_dir.display());
-    Ok(())
-}
-
-fn clear_previous_outputs(output_dir: &std::path::Path) -> Result<()> {
-    for entry in fs::read_dir(output_dir)
-        .with_context(|| format!("failed to read output dir {}", output_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let should_remove = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| {
-                name == "map_index.json" || (name.starts_with("tile_") && name.ends_with(".rkyv"))
-            })
-            .unwrap_or(false);
-
-        if should_remove {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to remove stale output {}", path.display()))?;
-        }
-    }
-
+    println!(
+        "Wrote map bundle to {} using up to {} worker thread(s)",
+        output_dir.display(),
+        thread_count
+    );
     Ok(())
 }

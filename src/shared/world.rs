@@ -4,6 +4,7 @@ use rkyv::{Archive, Deserialize, Serialize, access, rancor::Error as RkyvError, 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::process;
 
 pub const MAP_ASSETS_DIR: &str = "assets/map";
 pub const TILE_FORMAT_VERSION: u32 = 1;
@@ -142,6 +143,8 @@ pub struct MapIndex {
     pub version: u32,
     pub region: String,
     pub source_pbf: String,
+    pub total_chunks_estimate: u64,
+    pub total_tile_count: u32,
     pub lod_count: u8,
     pub lod_viewing_distances_m: Vec<f32>,
     pub lod_simplification_tolerances_m: Vec<f32>,
@@ -220,12 +223,14 @@ pub fn tile_file_name(tile_id: u32) -> String {
 pub fn write_tile_file(path: &Path, tile: &TileData) -> Result<()> {
     let bytes = to_bytes::<RkyvError>(tile)
         .map_err(|err| anyhow!("failed to serialize tile {}: {err}", tile.tile_id))?;
-    fs::write(path, &bytes).with_context(|| format!("failed to write tile file {}", path.display()))
+    atomic_write_bytes(path, &bytes)
+        .with_context(|| format!("failed to write tile file {}", path.display()))
 }
 
 pub fn write_map_index(path: &Path, index: &MapIndex) -> Result<()> {
     let json = serde_json::to_vec_pretty(index).context("failed to serialize map index json")?;
-    fs::write(path, json).with_context(|| format!("failed to write map index {}", path.display()))
+    atomic_write_bytes(path, &json)
+        .with_context(|| format!("failed to write map index {}", path.display()))
 }
 
 pub fn read_map_index(path: &Path) -> Result<MapIndex> {
@@ -256,4 +261,30 @@ impl MappedTile {
         access::<ArchivedTileData, RkyvError>(&self.mmap)
             .map_err(|err| anyhow!("failed to access archived tile data: {err}"))
     }
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("path {} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create directory {}", parent.display()))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("path {} has no valid file name", path.display()))?;
+    let temp_path = parent.join(format!("{file_name}.{}.tmp", process::id()));
+
+    fs::write(&temp_path, bytes)
+        .with_context(|| format!("failed to write temp file {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to atomically replace {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+
+    Ok(())
 }

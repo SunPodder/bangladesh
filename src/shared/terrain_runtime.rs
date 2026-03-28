@@ -31,6 +31,7 @@ struct TerrainRuntimeConfig {
 #[derive(Resource)]
 struct TerrainWorldState {
     index: MapIndex,
+    available_tiles: HashSet<u32>,
     loaded_tiles: HashMap<u32, LoadedTile>,
     current_lod: u8,
 }
@@ -140,6 +141,7 @@ fn open_world(
     let index_path = map_index_path(&config.region);
     match read_map_index(&index_path) {
         Ok(index) => {
+            let available_tiles = index.tiles.iter().map(|tile| tile.id).collect();
             let bounds = &index.world_bounds_mercator;
             let start_x = ((bounds.min_x + bounds.max_x) * 0.5) as f32;
             let start_y = ((bounds.min_y + bounds.max_y) * 0.5) as f32;
@@ -174,6 +176,7 @@ fn open_world(
 
             commands.insert_resource(TerrainWorldState {
                 index,
+                available_tiles,
                 loaded_tiles: HashMap::new(),
                 current_lod,
             });
@@ -322,6 +325,9 @@ fn update_loaded_tiles(
 
     for tile_id in desired {
         if state.loaded_tiles.contains_key(&tile_id) {
+            continue;
+        }
+        if !state.available_tiles.contains(&tile_id) {
             continue;
         }
 

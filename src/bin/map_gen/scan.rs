@@ -2,19 +2,14 @@ use crate::geometry::{Bounds, LatLonBounds, lat_lon_to_web_mercator};
 use crate::grid::{TileGrid, parse_tile_id_ranges};
 use crate::types::{LodSettings, ScanResult};
 use anyhow::{Context, Result, ensure};
+use bangladesh::shared::world::region_map_path;
 use clap::Args;
 use osmpbf::{Element, ElementReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Args)]
 pub struct GenerateArgs {
     #[arg(long)]
-    pub pbf_path: std::path::PathBuf,
-
-    #[arg(long)]
-    pub output_dir: std::path::PathBuf,
-
-    #[arg(long, default_value = "bangladesh")]
     pub region: String,
 
     #[arg(long, default_value_t = 100_000)]
@@ -33,12 +28,23 @@ pub struct GenerateArgs {
     pub progress: bool,
 }
 
+impl GenerateArgs {
+    pub fn pbf_path(&self) -> PathBuf {
+        region_map_path(&self.region).join(format!("{}.pbf", self.region))
+    }
+
+    pub fn output_dir(&self) -> PathBuf {
+        region_map_path(&self.region)
+    }
+}
+
 pub fn scan_pbf(args: &GenerateArgs) -> Result<(TileGrid, ScanResult)> {
-    let (mercator_bounds, lat_lon_bounds) = scan_bounds(&args.pbf_path)?;
+    let pbf_path = args.pbf_path();
+    let (mercator_bounds, lat_lon_bounds) = scan_bounds(&pbf_path)?;
     let grid = TileGrid::from_bounds(mercator_bounds, args.tile_size)?;
     let tile_specs = grid.tile_specs();
-    let total_chunks = (mercator_bounds.area() / 1_000_000.0).max(1.0);
-    let lod_count = ((total_chunks / 1000.0).log2().ceil() as i32 + 1).max(2) as usize;
+    let total_chunks = (mercator_bounds.area() / 1_000_000.0).max(1.0).ceil() as u64;
+    let lod_count = (((total_chunks as f64) / 1000.0).log2().ceil() as i32 + 1).max(2) as usize;
 
     let default_distances = [
         50.0_f32, 200.0, 1_000.0, 5_000.0, 20_000.0, 100_000.0, 500_000.0,
@@ -77,6 +83,7 @@ pub fn scan_pbf(args: &GenerateArgs) -> Result<(TileGrid, ScanResult)> {
         ScanResult {
             mercator_bounds,
             lat_lon_bounds,
+            total_chunks_estimate: total_chunks,
             tile_specs,
             selected_tile_ids,
             lods,

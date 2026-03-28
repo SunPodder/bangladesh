@@ -52,6 +52,7 @@ pub struct LodSettings {
 pub struct ScanResult {
     pub mercator_bounds: Bounds,
     pub lat_lon_bounds: crate::geometry::LatLonBounds,
+    pub total_chunks_estimate: u64,
     pub tile_specs: Vec<TileSpec>,
     pub selected_tile_ids: Vec<u32>,
     pub lods: Vec<LodSettings>,
