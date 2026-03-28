@@ -1,5 +1,6 @@
 use bangladesh::shared::world::TerrainKind;
 
+#[allow(dead_code)]
 pub fn is_area_hint_key(key: &str) -> bool {
     matches!(
         key,
@@ -22,9 +23,7 @@ pub fn classify_tag_pair(key: &str, value: &str) -> Option<TerrainKind> {
         | ("landuse", "wood")
         | ("natural", "heath")
         | ("natural", "scrub")
-        | ("natural", "tree_row") => {
-            Some(TerrainKind::Forest)
-        }
+        | ("natural", "tree_row") => Some(TerrainKind::Forest),
 
         ("landuse", "residential")
         | ("landuse", "commercial")

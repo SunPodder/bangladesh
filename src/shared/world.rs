@@ -1,20 +1,29 @@
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
+use memmap2::{Mmap, MmapOptions};
 use rkyv::{Archive, Deserialize, Serialize, access, rancor::Error as RkyvError, to_bytes};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-pub const WORLD_MAGIC: &[u8; 8] = b"BDWORLD1";
-pub const WORLD_VERSION_V2: u32 = 2;
-pub const WORLD_VERSION_V3: u32 = 3;
-pub const WORLD_VERSION: u32 = WORLD_VERSION_V3;
-const WORLD_HEADER_SIZE: usize = 8 + 4 + 8;
-const MAP_ASSETS_DIR: &str = "assets/map";
+pub const MAP_ASSETS_DIR: &str = "assets/map";
+pub const TILE_FORMAT_VERSION: u32 = 1;
+pub const QUANTIZATION_SCALE: f32 = 100.0;
 
 #[repr(u8)]
 #[derive(
-    Archive, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash,
+    Archive,
+    Serialize,
+    Deserialize,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
 )]
 pub enum TerrainKind {
     Unknown = 0,
@@ -28,23 +37,6 @@ pub enum TerrainKind {
 }
 
 impl TerrainKind {
-    pub fn from_code(value: u8) -> Self {
-        match value {
-            1 => Self::Water,
-            2 => Self::Grass,
-            3 => Self::Forest,
-            4 => Self::Urban,
-            5 => Self::Farmland,
-            6 => Self::Sand,
-            7 => Self::Road,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub fn code(self) -> u8 {
-        self as u8
-    }
-
     pub fn priority(self) -> u8 {
         match self {
             Self::Unknown => 0,
@@ -59,324 +51,209 @@ impl TerrainKind {
     }
 }
 
-#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct TerrainTile {
-    pub zoom: u8,
-    pub tile_x: i32,
-    pub tile_y: i32,
-    pub cells: Vec<u8>,
+#[repr(u8)]
+#[derive(
+    Archive,
+    Serialize,
+    Deserialize,
+    SerdeSerialize,
+    SerdeDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+)]
+pub enum RoadClass {
+    Motorway = 0,
+    Primary = 1,
+    Secondary = 2,
+    Local = 3,
+    Service = 4,
+    Track = 5,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct QuantizedPoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct QuantizedBounds {
+    pub min_x: i32,
+    pub min_y: i32,
+    pub max_x: i32,
+    pub max_y: i32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct TileMetadata {
-    pub zoom: u8,
-    pub tile_x: i32,
-    pub tile_y: i32,
-    pub byte_offset: u64,
-    pub byte_len: u32,
+pub struct AreaFeature {
+    pub kind: TerrainKind,
+    pub bounds: QuantizedBounds,
+    pub rings: Vec<Vec<QuantizedPoint>>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Debug, Clone)]
-pub struct WorldMetadata {
+pub struct BuildingFeature {
+    pub bounds: QuantizedBounds,
+    pub footprint: Vec<QuantizedPoint>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct RoadFeature {
+    pub class: RoadClass,
+    pub width_m: f32,
+    pub bounds: QuantizedBounds,
+    pub points: Vec<QuantizedPoint>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct PoiFeature {
+    pub kind: String,
+    pub name: Option<String>,
+    pub point: QuantizedPoint,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct LodData {
+    pub lod_level: u8,
+    pub roads: Vec<RoadFeature>,
+    pub buildings: Vec<BuildingFeature>,
+    pub areas: Vec<AreaFeature>,
+    pub pois: Vec<PoiFeature>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+pub struct TileData {
+    pub version: u32,
+    pub tile_id: u32,
+    pub grid_x: u32,
+    pub grid_y: u32,
+    pub tile_size_m: u32,
+    pub origin_x_m: f64,
+    pub origin_y_m: f64,
+    pub lods: Vec<LodData>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+pub struct MapIndex {
+    pub version: u32,
     pub region: String,
     pub source_pbf: String,
-    pub generated_unix_seconds: u64,
-    pub chunk_size_m: f32,
-    pub cells_per_side: u16,
-    pub playable_zoom_level: u8,
-    pub playable_tile_offset_x: i32,
-    pub playable_tile_offset_y: i32,
-    pub mercator_origin_x_m: f64,
-    pub mercator_origin_y_m: f64,
-    pub local_bounds_min_x: f32,
-    pub local_bounds_min_y: f32,
-    pub local_bounds_max_x: f32,
-    pub local_bounds_max_y: f32,
-    pub tile_count: u32,
-    pub tiles: Vec<TileMetadata>,
+    pub lod_count: u8,
+    pub lod_viewing_distances_m: Vec<f32>,
+    pub lod_simplification_tolerances_m: Vec<f32>,
+    pub quantization_scale: f32,
+    pub tile_grid: TileGridMetadata,
+    pub world_bounds_mercator: BoundsMetadata,
+    pub world_bounds_lat_lon: LatLonBoundsMetadata,
+    pub tiles: Vec<TileManifest>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ChunkLocation {
-    pub byte_offset: u64,
-    pub byte_len: u32,
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+pub struct TileGridMetadata {
+    pub origin_x_m: f64,
+    pub origin_y_m: f64,
+    pub tile_size_m: u32,
+    pub cols: u32,
+    pub rows: u32,
 }
 
-#[derive(Debug, Clone)]
-pub struct WorldIndex {
-    pub region: String,
-    pub chunk_size_m: f32,
-    pub cells_per_side: u16,
-    pub playable_zoom_level: u8,
-    pub playable_tile_offset_x: i32,
-    pub playable_tile_offset_y: i32,
-    pub local_bounds_min_x: f32,
-    pub local_bounds_min_y: f32,
-    pub local_bounds_max_x: f32,
-    pub local_bounds_max_y: f32,
-    pub tiles: HashMap<(u8, i32, i32), ChunkLocation>,
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+pub struct BoundsMetadata {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
 }
 
-#[derive(Debug)]
-pub struct WorldStreamReader {
-    pub index: WorldIndex,
-    file: File,
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+pub struct LatLonBoundsMetadata {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
 }
 
-#[derive(Debug)]
-pub struct WorldWriter {
-    output_path: PathBuf,
-    world_file: File,
-    tile_entries: Vec<TileMetadata>,
-    tile_data_len: u64,
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, Default)]
+pub struct EntityCounts {
+    pub roads: usize,
+    pub buildings: usize,
+    pub areas: usize,
+    pub pois: usize,
 }
 
-enum HeaderInfo {
-    V2 { metadata_len: u64 },
-    V3 { metadata_offset: u64 },
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone)]
+pub struct TileManifest {
+    pub id: u32,
+    pub grid_x: u32,
+    pub grid_y: u32,
+    pub file: String,
+    pub file_size_bytes: u64,
+    pub origin_x_m: f64,
+    pub origin_y_m: f64,
+    pub entity_counts: EntityCounts,
 }
 
 pub fn map_assets_path() -> PathBuf {
     Path::new(MAP_ASSETS_DIR).to_path_buf()
 }
 
-pub fn world_output_path(region: &str) -> PathBuf {
-    map_assets_path().join(format!("{region}.world"))
+pub fn region_map_path(region: &str) -> PathBuf {
+    map_assets_path().join(region)
 }
 
-pub fn write_world_file(
-    path: &Path,
-    metadata: WorldMetadata,
-    tiles: Vec<TerrainTile>,
-) -> Result<()> {
-    let mut writer = WorldWriter::new(path)?;
-    for tile in tiles {
-        writer.write_tile(tile.zoom, tile.tile_x, tile.tile_y, tile.cells)?;
-    }
-    writer.finish(path, metadata)
+pub fn map_index_path(region: &str) -> PathBuf {
+    region_map_path(region).join("map_index.json")
 }
 
-impl WorldWriter {
-    pub fn new(output_path: &Path) -> Result<Self> {
-        let mut world_file = File::create(output_path).with_context(|| {
-            format!("failed to create world output at {}", output_path.display())
-        })?;
-        world_file
-            .write_all(WORLD_MAGIC)
-            .context("failed to write world magic")?;
-        world_file
-            .write_all(&WORLD_VERSION.to_le_bytes())
-            .context("failed to write world version")?;
-        world_file
-            .write_all(&0_u64.to_le_bytes())
-            .context("failed to write world metadata offset placeholder")?;
-
-        Ok(Self {
-            output_path: output_path.to_path_buf(),
-            world_file,
-            tile_entries: Vec::new(),
-            tile_data_len: 0,
-        })
-    }
-
-    pub fn write_tile(&mut self, zoom: u8, tile_x: i32, tile_y: i32, cells: Vec<u8>) -> Result<()> {
-        let tile = TerrainTile {
-            zoom,
-            tile_x,
-            tile_y,
-            cells,
-        };
-
-        let bytes = to_bytes::<RkyvError>(&tile)
-            .map_err(|err| anyhow!("failed to serialize terrain tile: {err}"))?;
-        ensure!(
-            u32::try_from(bytes.len()).is_ok(),
-            "serialized terrain tile is too large"
-        );
-
-        let tile_offset = (WORLD_HEADER_SIZE as u64) + self.tile_data_len;
-
-        self.world_file
-            .write_all(&bytes)
-            .with_context(|| {
-                format!(
-                    "failed to append serialized tile bytes to {}",
-                    self.output_path.display()
-                )
-            })?;
-
-        self.tile_entries.push(TileMetadata {
-            zoom,
-            tile_x,
-            tile_y,
-            byte_offset: tile_offset,
-            byte_len: bytes.len() as u32,
-        });
-        self.tile_data_len += bytes.len() as u64;
-
-        Ok(())
-    }
-
-    pub fn write_tile_from_slice(
-        &mut self,
-        zoom: u8,
-        tile_x: i32,
-        tile_y: i32,
-        cells: &[u8],
-    ) -> Result<()> {
-        self.write_tile(zoom, tile_x, tile_y, cells.to_vec())
-    }
-
-    pub fn tile_count(&self) -> usize {
-        self.tile_entries.len()
-    }
-
-    pub fn finish(mut self, output_path: &Path, mut metadata: WorldMetadata) -> Result<()> {
-        metadata.tile_count = self.tile_entries.len() as u32;
-        metadata.tiles = self.tile_entries;
-
-        let metadata_bytes = to_bytes::<RkyvError>(&metadata)
-            .map_err(|err| anyhow!("failed to serialize world metadata: {err}"))?;
-
-        let metadata_offset = (WORLD_HEADER_SIZE as u64) + self.tile_data_len;
-        self.world_file
-            .write_all(&metadata_bytes)
-            .context("failed to write world metadata trailer")?;
-
-        self.world_file
-            .seek(SeekFrom::Start((WORLD_MAGIC.len() + std::mem::size_of::<u32>()) as u64))
-            .context("failed to seek to metadata pointer slot")?;
-        self.world_file
-            .write_all(&metadata_offset.to_le_bytes())
-            .context("failed to backfill metadata pointer")?;
-        self.world_file
-            .flush()
-            .context("failed to flush world output file")?;
-
-        let _ = output_path;
-
-        Ok(())
-    }
+pub fn map_tile_path(region: &str, tile_id: u32) -> PathBuf {
+    region_map_path(region).join(tile_file_name(tile_id))
 }
 
-impl WorldStreamReader {
+pub fn tile_file_name(tile_id: u32) -> String {
+    format!("tile_{tile_id}.rkyv")
+}
+
+pub fn write_tile_file(path: &Path, tile: &TileData) -> Result<()> {
+    let bytes = to_bytes::<RkyvError>(tile)
+        .map_err(|err| anyhow!("failed to serialize tile {}: {err}", tile.tile_id))?;
+    fs::write(path, &bytes).with_context(|| format!("failed to write tile file {}", path.display()))
+}
+
+pub fn write_map_index(path: &Path, index: &MapIndex) -> Result<()> {
+    let json = serde_json::to_vec_pretty(index).context("failed to serialize map index json")?;
+    fs::write(path, json).with_context(|| format!("failed to write map index {}", path.display()))
+}
+
+pub fn read_map_index(path: &Path) -> Result<MapIndex> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read map index {}", path.display()))?;
+    serde_json::from_slice(&bytes).context("failed to deserialize map index json")
+}
+
+pub struct MappedTile {
+    _file: File,
+    mmap: Mmap,
+}
+
+impl MappedTile {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)
-            .with_context(|| format!("failed to open world file {}", path.display()))?;
-        let header = read_header(&mut file)?;
-
-        let metadata_bytes = match header {
-            HeaderInfo::V2 { metadata_len } => {
-                let mut bytes = vec![0_u8; metadata_len as usize];
-                file.read_exact(&mut bytes)
-                    .context("failed to read v2 world metadata bytes")?;
-                bytes
-            }
-            HeaderInfo::V3 { metadata_offset } => {
-                let file_len = file
-                    .metadata()
-                    .with_context(|| format!("failed to stat world file {}", path.display()))?
-                    .len();
-                ensure!(
-                    metadata_offset <= file_len,
-                    "invalid metadata offset in world file"
-                );
-                let metadata_len = file_len - metadata_offset;
-                ensure!(
-                    usize::try_from(metadata_len).is_ok(),
-                    "world metadata too large for this platform"
-                );
-
-                file.seek(SeekFrom::Start(metadata_offset))
-                    .context("failed to seek to v3 world metadata")?;
-                let mut bytes = vec![0_u8; metadata_len as usize];
-                file.read_exact(&mut bytes)
-                    .context("failed to read v3 world metadata bytes")?;
-                bytes
-            }
+        let file = File::open(path)
+            .with_context(|| format!("failed to open tile file {}", path.display()))?;
+        let mmap = unsafe {
+            MmapOptions::new()
+                .map(&file)
+                .with_context(|| format!("failed to mmap tile file {}", path.display()))?
         };
 
-        let archived = access::<ArchivedWorldMetadata, RkyvError>(&metadata_bytes)
-            .map_err(|err| anyhow!("failed to access archived world metadata: {err}"))?;
-
-        let mut tiles = HashMap::with_capacity(archived.tiles.len());
-        for entry in archived.tiles.iter() {
-            tiles.insert(
-                (entry.zoom.into(), entry.tile_x.into(), entry.tile_y.into()),
-                ChunkLocation {
-                    byte_offset: entry.byte_offset.into(),
-                    byte_len: entry.byte_len.into(),
-                },
-            );
-        }
-
-        let index = WorldIndex {
-            region: archived.region.as_str().to_string(),
-            chunk_size_m: archived.chunk_size_m.into(),
-            cells_per_side: archived.cells_per_side.into(),
-            playable_zoom_level: archived.playable_zoom_level.into(),
-            playable_tile_offset_x: archived.playable_tile_offset_x.into(),
-            playable_tile_offset_y: archived.playable_tile_offset_y.into(),
-            local_bounds_min_x: archived.local_bounds_min_x.into(),
-            local_bounds_min_y: archived.local_bounds_min_y.into(),
-            local_bounds_max_x: archived.local_bounds_max_x.into(),
-            local_bounds_max_y: archived.local_bounds_max_y.into(),
-            tiles,
-        };
-
-        Ok(Self { index, file })
+        Ok(Self { _file: file, mmap })
     }
 
-    pub fn load_tile_bytes(
-        &mut self,
-        zoom: u8,
-        tile_x: i32,
-        tile_y: i32,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(location) = self.index.tiles.get(&(zoom, tile_x, tile_y)).copied() else {
-            return Ok(None);
-        };
-
-        let mut data = vec![0_u8; location.byte_len as usize];
-        self.file
-            .seek(SeekFrom::Start(location.byte_offset))
-            .with_context(|| {
-                format!(
-                    "failed to seek to tile ({zoom}, {tile_x}, {tile_y}) at {}",
-                    location.byte_offset
-                )
-            })?;
-        self.file
-            .read_exact(&mut data)
-            .with_context(|| format!("failed to read tile ({zoom}, {tile_x}, {tile_y}) bytes"))?;
-
-        Ok(Some(data))
-    }
-}
-
-fn read_header(file: &mut File) -> Result<HeaderInfo> {
-    let mut magic = [0_u8; 8];
-    file.read_exact(&mut magic)
-        .context("failed to read world magic")?;
-    ensure!(magic == *WORLD_MAGIC, "invalid world file magic");
-
-    let mut version_buf = [0_u8; 4];
-    file.read_exact(&mut version_buf)
-        .context("failed to read world version")?;
-    let version = u32::from_le_bytes(version_buf);
-
-    let mut metadata_ptr_buf = [0_u8; 8];
-    file.read_exact(&mut metadata_ptr_buf)
-        .context("failed to read world metadata pointer")?;
-    let metadata_ptr = u64::from_le_bytes(metadata_ptr_buf);
-
-    match version {
-        WORLD_VERSION_V2 => Ok(HeaderInfo::V2 {
-            metadata_len: metadata_ptr,
-        }),
-        WORLD_VERSION_V3 => Ok(HeaderInfo::V3 {
-            metadata_offset: metadata_ptr,
-        }),
-        _ => Err(anyhow!("unsupported world version: {version}")),
+    pub fn archived(&self) -> Result<&ArchivedTileData> {
+        access::<ArchivedTileData, RkyvError>(&self.mmap)
+            .map_err(|err| anyhow!("failed to access archived tile data: {err}"))
     }
 }

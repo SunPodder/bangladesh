@@ -3,41 +3,24 @@
 ## World Scaling & GIS
 - **Scale**: 1:1 (1 real-meter = 1 game unit).
 - **Coordinate System**: WGS84 (Lat/Lon) projected to Web Mercator (EPSG:3857).
-- **Chunking**: The map is divided into $1024m \times 1024m$ spatial chunks (about $1km^2$) for lazy loading.
+- **Tile Strategy**: Offline map baking targets independent `100km x 100km` tiles for country-scale generation and streaming.
 
 ## Data Pipeline
-- **Ingestion**: `map_gen` fetches PBF extracts from Geofabrik/BBBike.
-- **Processing (Terrain-first)**: `map_gen` parses terrain tags from both closed OSM ways and `type=multipolygon` relations (outer way members stitched into rings), resolves required node coordinates in a second pass, projects to Web Mercator, and rasterizes polygons to chunk-local terrain cells.
-- **Road Layer Extraction**: `map_gen` separately scans `highway=*` line ways (excluding non-road/tagged area semantics), assigns width classes by highway type, and rasterizes line segments into chunk cells as `TerrainKind::Road`.
-- **Urban Coverage Rule**: In terrain extraction, `building=*`, `amenity=*`, and `office=*` tags are treated as urban area signals (while higher-priority classes like water still win via terrain priority).
-- **Terrain Tag Filters Module**: Tag-to-terrain filters and priority winner selection are centralized in `terrain_tag_filters.rs` and reused for both way and relation classification.
-- **Local Tag Coverage**: Terrain filters explicitly include additional Bangladesh extract variants from `landuse=*`, `leisure=*`, and `natural=*` (for example `landuse=reservoir`, `landuse=slum`, `leisure=park`, `natural=scrub`) to reduce default-terrain fallback and preserve expected area semantics.
-- **Default Fallback Diagnostics**: If no terrain filter matches but area-hint keys exist, extraction falls back to default terrain and logs the unmatched area-hint `key=value` tags.
-- **Detail Resolution**: `map_gen` raster detail is configurable via `--cells-per-side` (even integer, default `256`), controlling max playable detail as $\text{cell size} = \frac{1024m}{\text{cells per side}}$.
-- **Pyramid Bake**: `map_gen` derives a sparse hierarchical tile pyramid from real raster chunks only (`zoom = playable..0`) by 2x downsampling each parent from 4 children. No synthetic detail subdivision is generated.
-- **Chunk Raster Windowing**: Rasterization now precomputes per-polygon chunk bounds, then processes bounded chunk-row windows in memory and emits finalized base tiles immediately; no global chunk->polygon map is retained.
-- **Parallel Chunk Rasterization**: Chunk cell computation now runs in Rayon workers with per-chunk local buffers in bounded batches; tile emission remains single-threaded and ordered to keep world writes deterministic and race-free.
-- **Raster Paint Order**: Per chunk, terrain polygons are painted first and roads are painted second; roads use higher terrain priority to remain visible over underlying land/water classes.
-- **Procedural Continuity Refinement**: After GIS raster paint, each chunk runs a deterministic local repair pass that bridges 1-cell road/water gaps, trims short dangling road stubs, removes tiny isolated road islands, and strengthens river-like water continuity while preserving chunk-edge continuations.
-- **In-Memory Pyramid Streaming**: Parent LOD levels are now reduced from streamed base rows in-memory (row-pair reducers per level), and each finalized parent tile is emitted directly to the world writer.
-- **Direct World Streaming Write**: `.world` generation now writes tile payloads directly to the final output file and appends metadata as a trailer pointer (world format v3), removing temporary tile spool files.
-- **Memory Strategy**: Raster memory is controlled by `--raster-memory-gib` (default `8`) and window sizing, keeping peak usage near the requested budget while preserving deterministic output ordering.
-- **Storage**: Map assets are unified in `assets/map/`: source `.pbf` and processed `.world` files are separated by extension in the same directory.
-- **Format**: `.world` stores compact metadata + tile index keyed by `(zoom, tile_x, tile_y)` + per-tile `rkyv` archived payloads.
-- **Runtime Loading**: Metadata is loaded first; terrain tiles are loaded on-demand by camera zoom + visible bounds. Full world file must never be loaded all at once.
+- **Input Contract**: `map_gen generate` takes an explicit `.osm.pbf` path and writes a region bundle to `assets/map/{region}/` or another chosen output directory.
+- **Stage 0 Scan**: The generator scans the PBF once for bounds, builds the tile grid, and derives LOD count with `max(2, ceil(log2(total_chunks / 1000)) + 1)`.
+- **Shared Parse Pass**: OSM ways, multipolygon relations, and POI nodes are parsed once into reusable vector features; required node coordinates are resolved in a second pass and projected to Web Mercator.
+- **Classification Rules**: `terrain_tag_filters.rs` remains the single source of truth for Bangladesh-specific terrain tags. Buildings are stored as a dedicated layer, and roads use explicit width/class buckets from `highway=*`.
+- **Library-first Cleanup**: The previous raster/procedural refinement path has been removed. Geometry cleanup and LOD simplification now rely on `geo` validation, repeated-point removal, and topology-preserving Visvalingam-Whyatt simplification.
+- **Spatial Assignment**: Features are assigned to overlapping tiles through `rstar` spatial indexes instead of custom chunk bucketing.
+- **Storage Layout**: Each region bundle contains `map_index.json` plus independent `tile_<id>.rkyv` files.
+- **Format**: `map_index.json` stores grid metadata, bounds, LOD thresholds, and per-tile manifests. Each tile archive stores vector areas, buildings, roads, and POIs quantized to tile-local `i32` coordinates.
+- **Runtime Loading**: The Bevy runtime loads `map_index.json` first, mmaps only visible tile files, and renders the active LOD directly from archived tile data.
 
 ## Zoom LOD
-- `playable_zoom_level` is the highest-detail terrain LOD available from real rasterized chunks.
-- Lower zooms are overview layers that progressively drop detail while preserving topology continuity.
-- Runtime camera zoom step `0` always fits the full map bounds on screen (with small padding) and uses LOD `0`.
-- Runtime can zoom in beyond the number of LOD levels to reach playable human-scale framing; when this happens, terrain remains on max LOD.
-- LOD selection is derived from camera scale and clamped to `0..playable_zoom_level`; only visible tiles (plus margin) stay resident.
-- Runtime zoom input is continuous (synthetic camera zoom), while LOD switches live on-the-fly with hysteresis around scale thresholds to avoid flicker/chatter at boundaries.
-- Playable camera framing is calibrated to target roughly `96m` visible across the viewport (street-level readability for a `1.8m` actor).
-- Pyramid downsampling now uses dominant-terrain voting per $2 \times 2$ sample window (with water-safe tie breaks) to prevent river/ocean classes from flooding land at overview zooms.
-- LOD water retention rule: for $2 \times 2$ windows with a 2-2 tie, edge-connected water pairs (row/column continuity) win to preserve major river channels in zoom 0 overviews; diagonal water pairs still defer to land tie-break priorities.
-- LOD road retention rule: for $2 \times 2$ windows with a 2-2 tie, edge-connected road pairs (row/column continuity) win to preserve major road corridors in zoom 0 overviews; diagonal road pairs still defer to dominant-terrain/tie-break resolution.
-- Low-LOD road topology cleanup (zoom `0..2`): after parent-tile downsampling, roads are deterministically de-clustered (dense interior erosion), orphan/island segments are pruned, and linear gaps are bridged so overview roads remain continuous guidance lines instead of scattered noise or solid road blocks.
+- LOD count is data-dependent rather than fixed, so city extracts stay shallow while country extracts gain more overview levels automatically.
+- Each tile bundles all LODs in one file; runtime zoom chooses which archived LOD to draw without changing file layout.
+- LOD thresholds come from `map_index.json` viewing distances while the camera keeps continuous zoom.
+- Runtime only keeps visible tiles plus a small preload margin resident.
 
 ## Networking (Server-Authoritative)
 - **Library**: `lightyear`.
@@ -47,17 +30,19 @@
 
 ## Repository Map
 - `src/main.rs`: Entry point. Handles CLI flags (`--server`, `--client`, `--host`).
-- `src/bin/map_gen/`: Modular GIS pipeline binary (`main.rs` + focused submodules).
-- `src/plugins/`: Core logic split into `shared`, `client`, and `server`.
-- `assets/map/`: Raw `.pbf` inputs and processed `.world` outputs.
+- `src/bin/map_gen/`: Vector-tile generation pipeline (`scan`, `parse`, `validate`, `serialize`, `index`, `grid`, `geometry`, `types`).
+- `src/shared/world.rs`: Shared tile/index schema plus rkyv/json IO helpers.
+- `src/shared/terrain_runtime.rs`: Runtime tile streaming, mmap loading, and gizmo rendering.
+- `assets/map/`: Generated per-region map bundles (`map_index.json` + `tile_*.rkyv`).
 - `architecture.md`: High-level system design & networking specs.
 - `agent.md`: Detailed rules for AI coding behavior.
 
 ## Core Tech
 - **Engine**: Bevy (Rust) - ECS Architecture.
-- **GIS**: `osmpbf`, `geo-types`.
+- **GIS**: `osmpbf`, `geo`, `rstar`.
+- **Serialization**: `rkyv`, `serde_json`, `memmap2`.
 - **Net**: `lightyear` (Server-authoritative).
-- **CLI**: `clap` (derive), `indicatif` (progress).
+- **CLI**: `clap`, `indicatif`, `rayon`.
 
 ## Runtime Debugging
-- Press `F3` in runtime to toggle an on-screen debug HUD with player coordinates, cursor world coordinates, and current loaded zoom level.
+- Press `F3` in runtime to toggle an on-screen debug HUD with player coordinates, current scale, active LOD, and loaded tile count.
