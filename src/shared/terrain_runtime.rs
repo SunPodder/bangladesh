@@ -164,15 +164,30 @@ fn open_world(
                 config.overview_padding_ratio,
             );
             let playable_scale = scale_for_view_width(window_width, config.playable_view_width_m);
+            let screen_span = window_width.max(window_height);
+            let min_scale = index
+                .lod_viewing_distances_m
+                .first()
+                .map(|distance| scale_for_view_radius(screen_span, *distance * 0.5))
+                .unwrap_or(playable_scale)
+                .min(playable_scale);
+            let max_scale = index
+                .lod_viewing_distances_m
+                .last()
+                .map(|distance| scale_for_view_radius(screen_span, *distance))
+                .unwrap_or(full_map_scale)
+                .max(full_map_scale)
+                .max(min_scale);
+            let initial_scale = playable_scale.clamp(min_scale, max_scale);
 
             if let Ok(mut projection) = projection_query.single_mut() {
                 if let Projection::Orthographic(ortho) = projection.as_mut() {
-                    ortho.scale = playable_scale;
+                    ortho.scale = initial_scale;
                 }
             }
 
             let current_lod =
-                select_lod_for_scale(&index, playable_scale, window_width, window_height);
+                select_lod_for_scale(&index, initial_scale, window_width, window_height);
 
             commands.insert_resource(TerrainWorldState {
                 index,
@@ -181,9 +196,9 @@ fn open_world(
                 current_lod,
             });
             commands.insert_resource(ZoomController {
-                min_scale: playable_scale,
-                max_scale: full_map_scale,
-                target_scale: playable_scale,
+                min_scale,
+                max_scale,
+                target_scale: initial_scale,
             });
         }
         Err(error) => {
@@ -379,23 +394,16 @@ fn draw_loaded_tiles(state: Option<Res<TerrainWorldState>>, mut gizmos: Gizmos) 
         }
 
         for building in lod.buildings.iter() {
-            let min = tile_to_world(
-                tile,
-                building.bounds.min_x.into(),
-                building.bounds.min_y.into(),
-            );
-            let max = tile_to_world(
-                tile,
-                building.bounds.max_x.into(),
-                building.bounds.max_y.into(),
-            );
-            let center = (min + max) * 0.5;
-            let size = (max - min).abs().max(Vec2::splat(1.0));
-            gizmos.rect_2d(
-                Isometry2d::new(center, Rot2::radians(0.0)),
-                size,
-                Color::srgb(0.69, 0.63, 0.57),
-            );
+            let points = building
+                .footprint
+                .iter()
+                .map(|point| tile_to_world(tile, point.x.into(), point.y.into()))
+                .collect::<Vec<_>>();
+            if points.len() >= 2 {
+                for window in points.windows(2) {
+                    gizmos.line_2d(window[0], window[1], Color::srgb(0.69, 0.63, 0.57));
+                }
+            }
         }
 
         for road in lod.roads.iter() {
@@ -541,6 +549,10 @@ fn terrain_color(terrain: &ArchivedTerrainKind) -> Color {
 
 fn scale_for_view_width(window_width: f32, view_width_m: f32) -> f32 {
     (view_width_m / window_width.max(1.0)).max(0.0001)
+}
+
+fn scale_for_view_radius(screen_span: f32, view_radius_m: f32) -> f32 {
+    ((view_radius_m * 2.0) / screen_span.max(1.0)).max(0.0001)
 }
 
 fn fit_scale_for_bounds(

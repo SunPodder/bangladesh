@@ -10,8 +10,10 @@ use bangladesh::shared::world::{
 };
 use geo::{
     BoundingRect, LineString, Polygon, RemoveRepeatedPoints, SimplifyVwPreserve, Validation,
+    algorithm::bool_ops::unary_union,
 };
 use rstar::{AABB, RTree, RTreeObject};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 struct IndexedFeature {
@@ -131,17 +133,15 @@ pub fn build_tile(
                     )
                 })
                 .collect(),
-            buildings: building_ids
-                .iter()
-                .filter_map(|index| {
-                    simplify_building(
-                        &parsed.buildings[*index],
-                        tile_spec.bounds,
-                        lod_level as u8,
-                        lod,
-                    )
-                })
-                .collect(),
+            buildings: building_ids.is_empty().then(Vec::new).unwrap_or_else(|| {
+                build_buildings(
+                    building_ids.as_slice(),
+                    parsed,
+                    tile_spec.bounds,
+                    lod_level as u8,
+                    lod,
+                )
+            }),
             areas: area_ids
                 .iter()
                 .filter_map(|index| {
@@ -216,12 +216,33 @@ fn simplify_area(
     })
 }
 
-fn simplify_building(
-    raw: &RawBuildingFeature,
+fn build_buildings(
+    building_ids: &[usize],
+    parsed: &ParsedMapData,
     tile_bounds: Bounds,
     lod_level: u8,
     lod: &LodSettings,
-) -> Option<BuildingFeature> {
+) -> Vec<BuildingFeature> {
+    let mut polygons = building_ids
+        .iter()
+        .filter_map(|index| simplify_building_polygon(&parsed.buildings[*index], lod_level, lod))
+        .collect::<Vec<_>>();
+
+    if lod_level >= 2 {
+        polygons = dissolve_dense_buildings(polygons, lod_level, lod);
+    }
+
+    polygons
+        .into_iter()
+        .filter_map(|polygon| building_feature_from_polygon(&polygon, tile_bounds))
+        .collect()
+}
+
+fn simplify_building_polygon(
+    raw: &RawBuildingFeature,
+    lod_level: u8,
+    lod: &LodSettings,
+) -> Option<Polygon<f64>> {
     let mut polygon = polygon_from_points(&raw.points)?;
     polygon.remove_repeated_points_mut();
     if !polygon.is_valid() {
@@ -231,18 +252,24 @@ fn simplify_building(
     if lod_level > 0 {
         polygon = polygon.simplify_vw_preserve(f64::from(lod.simplify_tolerance_m.powi(2)));
     }
-
-    let rect = polygon.bounding_rect()?;
-    let area = (rect.max().x - rect.min().x) * (rect.max().y - rect.min().y);
-    let min_area = if lod_level == 0 {
-        8.0
-    } else {
-        f64::from(lod.simplify_tolerance_m.max(1.0).powi(2)) * 6.0
-    };
-    if area < min_area {
+    if lod_level >= 2 {
+        polygon = snap_polygon_to_grid(&polygon, building_snap_grid_size_m(lod_level, lod))?;
+    }
+    if !polygon.is_valid() {
         return None;
     }
 
+    if building_polygon_area_hint(&polygon) < min_building_area(lod_level, lod) {
+        return None;
+    }
+
+    Some(polygon)
+}
+
+fn building_feature_from_polygon(
+    polygon: &Polygon<f64>,
+    tile_bounds: Bounds,
+) -> Option<BuildingFeature> {
     let footprint = polygon
         .exterior()
         .0
@@ -320,6 +347,133 @@ fn road_class_visible(class: RoadClass, lod_level: u8) -> bool {
         RoadClass::Service => lod_level <= 2,
         RoadClass::Track => lod_level <= 1,
     }
+}
+
+fn dissolve_dense_buildings(
+    polygons: Vec<Polygon<f64>>,
+    lod_level: u8,
+    lod: &LodSettings,
+) -> Vec<Polygon<f64>> {
+    if polygons.len() < 2 {
+        return polygons;
+    }
+
+    let bucket_size = building_cluster_bucket_size_m(lod_level, lod);
+    let dense_threshold = dense_building_threshold(lod_level);
+    let mut buckets: HashMap<(i32, i32), Vec<Polygon<f64>>> = HashMap::new();
+
+    for polygon in polygons {
+        let Some(rect) = polygon.bounding_rect() else {
+            continue;
+        };
+        let center_x = (rect.min().x + rect.max().x) * 0.5;
+        let center_y = (rect.min().y + rect.max().y) * 0.5;
+        let key = (
+            (center_x / bucket_size).floor() as i32,
+            (center_y / bucket_size).floor() as i32,
+        );
+        buckets.entry(key).or_default().push(polygon);
+    }
+
+    let mut output = Vec::new();
+    for (_, bucket) in buckets {
+        if bucket.len() < dense_threshold {
+            output.extend(bucket);
+            continue;
+        }
+
+        let merged = unary_union(&bucket);
+        output.extend(
+            merged
+                .0
+                .into_iter()
+                .filter(|polygon| polygon.is_valid())
+                .filter(|polygon| {
+                    building_polygon_area_hint(polygon) >= min_building_area(lod_level, lod)
+                }),
+        );
+    }
+
+    output
+}
+
+fn building_snap_grid_size_m(lod_level: u8, lod: &LodSettings) -> f64 {
+    if lod_level < 2 {
+        return 0.0;
+    }
+
+    f64::from(lod.simplify_tolerance_m.clamp(1.0, 32.0))
+}
+
+fn building_cluster_bucket_size_m(lod_level: u8, lod: &LodSettings) -> f64 {
+    let snap_grid = building_snap_grid_size_m(lod_level, lod).max(1.0);
+    (snap_grid * 12.0).clamp(32.0, 128.0)
+}
+
+fn dense_building_threshold(lod_level: u8) -> usize {
+    match lod_level {
+        2 => 12,
+        3 => 10,
+        4 => 8,
+        5 => 6,
+        _ => 4,
+    }
+}
+
+fn min_building_area(lod_level: u8, lod: &LodSettings) -> f64 {
+    if lod_level == 0 {
+        8.0
+    } else {
+        f64::from(lod.simplify_tolerance_m.max(1.0).powi(2)) * 6.0
+    }
+}
+
+fn building_polygon_area_hint(polygon: &Polygon<f64>) -> f64 {
+    let Some(rect) = polygon.bounding_rect() else {
+        return 0.0;
+    };
+    (rect.max().x - rect.min().x) * (rect.max().y - rect.min().y)
+}
+
+fn snap_polygon_to_grid(polygon: &Polygon<f64>, grid_size_m: f64) -> Option<Polygon<f64>> {
+    if grid_size_m <= 0.0 {
+        return Some(polygon.clone());
+    }
+
+    let mut coords = polygon
+        .exterior()
+        .0
+        .iter()
+        .map(|coord| geo::Coord {
+            x: snap_coord(coord.x, grid_size_m),
+            y: snap_coord(coord.y, grid_size_m),
+        })
+        .fold(Vec::new(), |mut acc, coord| {
+            if acc.last().copied() != Some(coord) {
+                acc.push(coord);
+            }
+            acc
+        });
+
+    if coords.first().copied() != coords.last().copied() {
+        let first = *coords.first()?;
+        coords.push(first);
+    }
+
+    if coords.len() < 4 {
+        return None;
+    }
+
+    let mut polygon = Polygon::new(LineString(coords), vec![]);
+    polygon.remove_repeated_points_mut();
+    if !polygon.is_valid() || polygon.exterior().0.len() < 4 {
+        return None;
+    }
+    Some(polygon)
+}
+
+fn snap_coord(value: f64, grid_size_m: f64) -> f64 {
+    (value / grid_size_m).round() * grid_size_m
 }
 
 fn polygon_from_points(points: &[[f64; 2]]) -> Option<Polygon<f64>> {
